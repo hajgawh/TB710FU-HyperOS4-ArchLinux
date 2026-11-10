@@ -1,0 +1,39 @@
+#!/bin/sh
+# TB710FU: prepare the writable HexagonFS tree for hexagonrpcd.
+#
+# hexagonrpcd serves files to sensorspd through a reverse tunnel.  The SNS
+# registry must be writable: sensorspd rewrites parsed registry entries and
+# calibration data, and a read-only tree leaves the SSC registry empty.
+# Keep the packaged seed under /usr/share and use a persistent state copy here.
+set -eu
+
+SRC=/usr/share/qcom/sm8650/Lenovo/tb710fu
+DST=/var/lib/hexagonrpcd
+
+# StateDirectory=hexagonrpcd normally creates this before ExecStartPre, but
+# keep the script usable by hand as well.
+install -d -m 0750 -o fastrpc -g fastrpc "$DST" "$DST/sensors" "$DST/sensors/persist"
+
+# Seed once.  Never overwrite an existing state directory: it contains the
+# registry the DSP parsed and any calibration it persisted.
+if [ ! -d "$DST/sensors/persist/registry" ]; then
+	cp -a "$SRC/sensors/registry" "$DST/sensors/persist/registry"
+fi
+
+ln -sfn "$SRC/sensors/config" "$DST/sensors/config"
+ln -sfn "$SRC/sensors/sns_reg.conf" "$DST/sensors/sns_reg.conf"
+ln -sfn "$SRC/socinfo" "$DST/socinfo"
+ln -sfn "$SRC/dsp" "$DST/dsp"
+
+chown -R fastrpc:fastrpc "$DST/sensors/persist"
+chmod -R u+rwX,go-rwx "$DST/sensors/persist"
+
+# The service runs as fastrpc.  Wait until udev has applied the fastrpc
+# ownership to the FastRPC node; otherwise the first open gets EACCES and the
+# registry-initialisation window after ADSP boot can be missed.
+i=0
+while [ "$(stat -c %U /dev/fastrpc-adsp 2>/dev/null)" != fastrpc ]; do
+	i=$((i + 1))
+	[ "$i" -ge 100 ] && exit 1
+	sleep 0.1
+done

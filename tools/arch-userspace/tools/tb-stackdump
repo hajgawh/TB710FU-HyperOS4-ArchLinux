@@ -1,0 +1,38 @@
+#!/bin/sh
+# TB710FU: dump kernel stacks to a file (no printk), synced per task so a
+# hard PMIC reset cannot lose the evidence.
+OUT=/var/log/tb-hangstack.log
+: > "$OUT"
+sync
+echo "== start uptime $(cut -d. -f1 /proc/uptime) ==" >> "$OUT"
+sync
+
+# Pass 1: uninterruptible tasks first (the wedged commit thread lives here).
+for t in /proc/[0-9]*/task/[0-9]*; do
+	st=$(awk '{print $3}' "$t/stat" 2>/dev/null)
+	[ "$st" = D ] || continue
+	{
+		echo "=== $t state=$st comm=$(cat "$t/comm" 2>/dev/null)"
+		echo "wchan=$(cat "$t/wchan" 2>/dev/null)"
+		echo "syscall=$(timeout 1 cat "$t/syscall" 2>/dev/null)"
+		timeout 1 cat "$t/stack" 2>/dev/null
+	} >> "$OUT" 2>&1
+	sync
+done
+
+# Pass 2: everything else that has a non-empty kernel stack.
+n=0
+for t in /proc/[0-9]*/task/[0-9]*; do
+	sk=$(timeout 1 cat "$t/stack" 2>/dev/null)
+	[ -z "$sk" ] && continue
+	{
+		echo "=== $t comm=$(cat "$t/comm" 2>/dev/null) state=$(awk '{print $3}' "$t/stat" 2>/dev/null)"
+		echo "$sk"
+	} >> "$OUT" 2>&1
+	n=$((n + 1))
+	[ $((n % 40)) -eq 0 ] && sync
+done
+sync
+echo "== done uptime $(cut -d. -f1 /proc/uptime) tasks=$n ==" >> "$OUT"
+sync
+echo "TBSTACK: wrote $OUT" > /dev/kmsg

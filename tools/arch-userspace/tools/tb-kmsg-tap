@@ -1,0 +1,13 @@
+#!/bin/sh
+# TB710FU: durable kernel log + 100ms heartbeat for hard-reset forensics.
+LOG=/var/log/tb-kmsg-tap.log
+HB=/var/log/tb-hb.log
+: > "$LOG"
+: > "$HB"
+stdbuf -oL dmesg -w >> "$LOG" &
+pid=$!
+while kill -0 "$pid" 2>/dev/null; do
+	sync
+	echo "$(cut -d. -f1 /proc/uptime)" >> "$HB"
+	sleep 0.1
+done

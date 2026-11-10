@@ -1,0 +1,22 @@
+{
+    "KPackageStructure": "Plasma/Applet",
+    "KPlugin": {
+        "Authors": [
+            { "Name": "TB710FU" }
+        ],
+        "Category": "System Information",
+        "Description": "Battery temperature bar with 38/39/40 °C thermal tiers",
+        "Icon": "battery-good-symbolic",
+        "Id": "org.tb710fu.batterytempbar",
+        "License": "MIT",
+        "Name": "Battery Temperature Bar",
+        "Name[zh_CN]": "电池温度条",
+        "Description[zh_CN]": "38/39/40°C 三档变色的电池温度条",
+        "Version": "1.0"
+    },
+    "X-Plasma-API": "declarativeappletscript",
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-MainScript": "ui/main.qml",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "SystemServices"
+}

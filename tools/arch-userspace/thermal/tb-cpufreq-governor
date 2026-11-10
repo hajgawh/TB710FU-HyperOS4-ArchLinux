@@ -1,0 +1,10 @@
+#!/bin/sh
+# TB710FU: set the cpufreq governor for all policies at boot.
+set -eu
+CONF=/etc/tb710fu/cpu-governor.conf
+GOV=schedutil
+[ -r "$CONF" ] && . "$CONF"
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+	[ -w "$p/scaling_governor" ] || continue
+	echo "$GOV" > "$p/scaling_governor"
+done

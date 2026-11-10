@@ -1,0 +1,36 @@
+From e35b76cb6a981d9d8abf81ce37bcd507c156a5ba Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:44:11 +0000
+Subject: [PATCH 20/27] tb710fu: restore factory Bluetooth address
+
+---
+ arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts | 2 +-
+ arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts       | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
+index 209e62fba..604eb02c7 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
+@@ -60,7 +60,7 @@
+  * all zeros = unset. The base dts carries another unit's address. */
+ &uart14 {
+ 	bluetooth {
+-		local-bd-address = [00 00 00 00 00 00];
++		local-bd-address = [55 44 33 22 11 02];
+ 	};
+ };
+ /* ADSP/CDSP firmware = this device's own split images from HyperOS
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+index 3bcd043e1..7f77bf113 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+@@ -1162,7 +1162,7 @@
+ 
+ 		/* The board's factory-assigned BT address, read from the
+ 		 * Android system.  The binding is little-endian: the textual
+-		 * address 02:11:22:33:44:56 is stored last byte first. */
++		 * address 02:11:22:33:44:55 is stored last byte first. */
+ 		local-bd-address = [55 44 33 22 11 02];
+ 
+ 		vddrfacmn-supply = <&vreg_pmu_rfa_cmn>;

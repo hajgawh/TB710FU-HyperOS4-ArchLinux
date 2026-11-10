@@ -1,0 +1,409 @@
+#!/bin/bash
+# tb-thermal-guard v5 - TB710FU battery-only thermal governor
+#
+# v5: the SoC already protects itself. LMH starts backing the CPU off around
+#     95 C junction (measured: cdev state 0, X4 request 3.3 GHz, cpuinfo_cur_freq
+#     only ~2.3-2.6 GHz) and the DT critical trip is 110 C. The userspace CPU
+#     temperature loop and all cooling-device writes are therefore gone.
+#
+#     Only the battery temperature is controlled, by capping the maximum
+#     frequency the scheduler may request:
+#       38.0 C yellow  -> X4 <= 2.6 GHz, A720 <= 2.4 GHz, A520 <= 1.8 GHz
+#       39.0 C red     -> X4 <= 2.3 GHz, A720 <= 2.1 GHz, A520 <= 1.5 GHz
+#       40.0 C purple  -> X4 <= 2.0 GHz, A720 <= 1.8 GHz, A520 <= 1.3 GHz
+#       40.5 C         -> per-cluster floor (emergency, keeps < 41 C)
+#       40.9 C         -> while charging, constant_charge_current = 0
+#     Every boundary has 0.5 C exit hysteresis.
+#
+#     The caps are written to scaling_max_freq, not to the cpufreq cooling
+#     devices, so they never fight the kernel/LMH thermal path. The selected
+#     value is the highest OPP at or below the configured target.
+#
+# Modes and test switches:
+#   --dry-run                 compute and log, never write (default)
+#   --enforce                 apply frequency caps and charge-current limits
+#   --simulate-batt=mC[,mC]   use these battery temperatures, one per second
+#                             (test only; last value repeats)
+#   --duration=SECONDS        exit after N seconds and restore (test only)
+#
+# Stop (systemctl stop / SIGTERM) restores the frequency ceilings and the
+# charge current this daemon changed. The kernel's 110 C critical trip is
+# never touched.
+
+set -u
+
+CONF=/etc/tb710fu/thermal-guard.conf
+CSV=/var/log/tb-thermal-guard.csv
+LOCK=/run/tb-thermal-guard.lock
+STATEFILE=/run/tb-thermal-guard.state
+BASELINE=/run/tb-thermal-guard.baseline
+
+MODE=dry-run
+SIM_BATT=""
+DURATION=0
+for arg in "$@"; do
+	case $arg in
+		--enforce) MODE=enforce ;;
+		--dry-run) MODE=dry-run ;;
+		--simulate-batt=*) SIM_BATT=${arg#*=} ;;
+		--duration=*) DURATION=${arg#*=} ;;
+		-h|--help)
+			sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+			exit 0
+			;;
+		*)
+			echo "usage: $0 [--dry-run|--enforce] [--simulate-batt=mC] [--duration=s]" >&2
+			exit 2
+			;;
+	esac
+done
+SIM_SEQ=()
+if [ -n "$SIM_BATT" ]; then
+	IFS=',' read -r -a _sim_parts <<< "$SIM_BATT"
+	for _v in "${_sim_parts[@]}"; do
+		case $_v in ''|*[!0-9]*) continue ;; esac
+		SIM_SEQ+=("$_v")
+	done
+fi
+case $DURATION in ''|*[!0-9]*) DURATION=0 ;; esac
+
+# ---- tunables (override in /etc/tb710fu/thermal-guard.conf) -------------
+BATT_T1=38000           # yellow
+BATT_T2=39000           # red
+BATT_T3=40000           # purple
+BATT_EMERG=40500        # emergency: per-cluster floor
+BATT_CRITICAL=40900     # charging hard stop
+BATT_EXIT_HYST=500      # 0.5 C hysteresis on the way down
+
+# tier -> frequency ceiling per cpufreq policy (kHz). The governor picks the
+# highest available OPP <= this value. p0=A520, p1/p3=A720, p5=X4.
+CAP_T1_0=1800000
+CAP_T1_1=2400000
+CAP_T1_3=2400000
+CAP_T1_5=2600000
+CAP_T2_0=1500000
+CAP_T2_1=2100000
+CAP_T2_3=2100000
+CAP_T2_5=2300000
+CAP_T3_0=1300000
+CAP_T3_1=1800000
+CAP_T3_3=1800000
+CAP_T3_5=2000000
+CAP_T4_0=1100000
+CAP_T4_1=1500000
+CAP_T4_3=1500000
+CAP_T4_5=1600000
+
+# charge-current caps (percent of constant_charge_current_max) while charging
+CHG_PCT_1=50
+CHG_PCT_2=25
+CHG_PCT_3=10
+CHG_PCT_4=2
+CHG_WRITE_INTERVAL=10   # seconds between charge-current changes
+[ -r "$CONF" ] && . "$CONF"
+
+POLICIES="0 1 3 5"
+BATT=/sys/class/power_supply/battery
+
+# ---- helpers ------------------------------------------------------------
+tlog() { printf '%s,%s,%s\n' "$(date '+%FT%T')" "$MODE" "$*" >> "$CSV"; }
+jlog() { printf '%s\n' "$*"; }
+num_file() { # $1=path -> digits only, empty on error
+	local v
+	v=$(cat "$1" 2>/dev/null) || { printf ''; return 0; }
+	case $v in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
+}
+
+declare -A FREQ_DESC BASE REQUESTED APPLIED
+
+build_freq_desc() { # $1=policy -> descending list, highest first
+	local p=$1 avail hw f out=""
+	hw=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/cpuinfo_max_freq")
+	[ -n "$hw" ] || return 1
+	avail=$(cat "/sys/devices/system/cpu/cpufreq/policy$p/scaling_available_frequencies" 2>/dev/null)
+	out="$hw"
+	if [ -n "$avail" ]; then
+		for f in $(echo "$avail" | tr ' ' '\n' | tac); do
+			[ "$f" = "$hw" ] || out="$out $f"
+		done
+	fi
+	printf '%s' "$out"
+}
+
+pick_freq() { # $1=policy $2=target kHz -> nearest OPP, max +2% over target
+	local p=$1 want=$2 limit best="" above="" f
+	limit=$((want * 102 / 100))
+	for f in ${FREQ_DESC[$p]}; do
+		if [ "$f" -le "$want" ]; then
+			best=$f
+			break
+		fi
+		above=$f
+	done
+	# Allow the next OPP up when it stays within 2% and is closer to the target.
+	if [ -n "$above" ] && [ "$above" -le "$limit" ]; then
+		if [ -z "$best" ] || [ $((above - want)) -lt $((want - best)) ]; then
+			best=$above
+		fi
+	fi
+	[ -n "$best" ] || best=${FREQ_DESC[$p]##* }
+	printf '%s' "$best"
+}
+
+cdev_path() { # $1=policy -> cooling_device path for cpufreq-cpuN
+	local want="cpufreq-cpu$1" c
+	for c in /sys/class/thermal/cooling_device*; do
+		[ "$(cat "$c/type" 2>/dev/null)" = "$want" ] && { printf '%s' "$c"; return 0; }
+	done
+	return 1
+}
+
+load_baseline() {
+	local line k v n=0
+	[ -r "$BASELINE" ] || return 1
+	while IFS='=' read -r k v; do
+		case $k in
+			BASE_0|BASE_1|BASE_3|BASE_5)
+				case $v in ''|*[!0-9]*) continue ;; esac
+				BASE[${k#BASE_}]=$v
+				n=$((n+1))
+				;;
+		esac
+	done < "$BASELINE"
+	[ "$n" -eq 4 ]
+}
+
+save_baseline() {
+	{
+		local p
+		for p in $POLICIES; do printf 'BASE_%s=%s\n' "$p" "${BASE[$p]}"; done
+	} > "$BASELINE.tmp" 2>/dev/null && mv -f "$BASELINE.tmp" "$BASELINE" 2>/dev/null
+}
+
+# ---- init ---------------------------------------------------------------
+for p in $POLICIES; do
+	FREQ_DESC[$p]=$(build_freq_desc "$p") || { jlog "FATAL: no freq table for policy$p"; exit 1; }
+done
+
+exec 9>"$LOCK" 2>/dev/null || true
+if command -v flock >/dev/null && ! flock -n 9; then
+	jlog "another instance holds $LOCK; exit"
+	exit 0
+fi
+
+# Baseline is the ceiling that was in place before this daemon changed
+# anything. It survives a crash (SIGKILL) via /run and is removed on a clean
+# stop, so a restart never mistakes its own cap for the baseline.
+if ! load_baseline; then
+	BASE=()
+	for p in $POLICIES; do
+		BASE[$p]=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+		[ -n "${BASE[$p]}" ] || BASE[$p]=${FREQ_DESC[$p]%% *}
+	done
+	[ "$MODE" = enforce ] && save_baseline
+fi
+for p in $POLICIES; do
+	REQUESTED[$p]=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+	[ -n "${REQUESTED[$p]}" ] || REQUESTED[$p]=${BASE[$p]}
+	APPLIED[$p]=${REQUESTED[$p]}
+done
+
+CHG_MAX_LAST=$(num_file "$BATT/constant_charge_current_max")
+CHG_OWNED=0
+LAST_CHG_CHANGE=0
+
+# v3 used to clamp the cpufreq cooling devices. Reset any leftover state so
+# the new scaling_max_freq ceiling is the only active limit.
+if [ "$MODE" = enforce ]; then
+	for p in $POLICIES; do
+		cd=$(cdev_path "$p" || true)
+		[ -n "$cd" ] || continue
+		s=$(num_file "$cd/cur_state")
+		if [ -n "$s" ] && [ "$s" != 0 ]; then
+			echo 0 > "$cd/cur_state" 2>/dev/null && \
+				jlog "reset leftover cooling_device cpufreq-cpu$p state $s -> 0"
+		fi
+	done
+fi
+
+restore() {
+	[ "$MODE" = enforce ] || return 0
+	local p cur base
+	for p in $POLICIES; do
+		cur=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+		[ -n "$cur" ] || continue
+		[ "$cur" = "${BASE[$p]}" ] && continue
+		echo "${BASE[$p]}" > "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq" 2>/dev/null && \
+			jlog "restore p$p max $cur -> ${BASE[$p]} kHz"
+	done
+	if [ "$CHG_OWNED" = 1 ]; then
+		base=$(num_file "$BATT/constant_charge_current_max")
+		[ -n "$base" ] || base=${CHG_MAX_LAST:-}
+		[ -n "$base" ] && echo "$base" > "$BATT/constant_charge_current" 2>/dev/null && \
+			jlog "restore charge current -> $base"
+	fi
+	rm -f "$BASELINE" "$BASELINE.tmp" 2>/dev/null
+}
+trap 'restore; exit 0' INT TERM EXIT
+
+HEADER="time,mode,batt_temp,batt_status,batt_tier,cap0,cap1,cap3,cap5,chg_pct"
+if [ -s "$CSV" ] && [ "$(head -n 1 "$CSV" 2>/dev/null)" != "$HEADER" ]; then
+	mv -f "$CSV" "${CSV%.csv}.v3.$(date '+%Y%m%d').csv" 2>/dev/null
+fi
+[ -s "$CSV" ] || echo "$HEADER" >> "$CSV"
+jlog "start mode=$MODE baseline p0=${BASE[0]} p1=${BASE[1]} p3=${BASE[3]} p5=${BASE[5]}"
+
+batt_tier=0
+start_ts=$(date +%s)
+loop_i=0
+first_iter=1
+while :; do
+	now=$(date +%s)
+	[ "$DURATION" -gt 0 ] && [ $((now - start_ts)) -ge "$DURATION" ] && break
+
+	# ---- battery temperature + 0.5 C hysteresis ladder ----
+	if [ ${#SIM_SEQ[@]} -gt 0 ]; then
+		idx=$loop_i
+		[ "$idx" -ge "${#SIM_SEQ[@]}" ] && idx=$((${#SIM_SEQ[@]} - 1))
+		bt=${SIM_SEQ[$idx]}
+		st=Charging
+	else
+		bt=0; st=unknown
+		if [ -r "$BATT/temp" ]; then
+			bt_raw=$(cat "$BATT/temp" 2>/dev/null) || bt_raw=0
+			case $bt_raw in ''|*[!0-9-]*) bt_raw=0 ;; esac
+			bt=$((bt_raw * 100))
+			st=$(cat "$BATT/status" 2>/dev/null) || st=unknown
+		fi
+	fi
+
+	prev_tier=$batt_tier
+	batt_tier=0
+	for tier in 4 3 2 1; do
+		case $tier in
+			4) enter=$BATT_EMERG ;;
+			3) enter=$BATT_T3 ;;
+			2) enter=$BATT_T2 ;;
+			1) enter=$BATT_T1 ;;
+		esac
+		exit_t=$((enter - BATT_EXIT_HYST))
+		if [ "$bt" -ge "$enter" ] || { [ "$prev_tier" -ge "$tier" ] && [ "$bt" -ge "$exit_t" ]; }; then
+			batt_tier=$tier
+			break
+		fi
+	done
+	if [ "$prev_tier" != "$batt_tier" ]; then
+		jlog "battery tier $prev_tier -> $batt_tier (batt=${bt}mC ${st})$([ -n "$SIM_BATT" ] && echo ' [simulated]')"
+	fi
+
+	# Entering a capped tier from a passive tier: remember whatever external
+	# ceiling is in place now (for example a CPUMax power mode) so releasing
+	# the battery tier restores that value, not a stale one.
+	if [ "$prev_tier" = 0 ] && [ "$batt_tier" -gt 0 ] && [ "$first_iter" = 0 ]; then
+		for p in $POLICIES; do
+			cur=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+			[ -n "$cur" ] && BASE[$p]=$cur
+		done
+		[ "$MODE" = enforce ] && save_baseline
+		jlog "release ceilings captured: p0=${BASE[0]} p1=${BASE[1]} p3=${BASE[3]} p5=${BASE[5]}"
+	fi
+
+	# ---- frequency ceilings ----
+	for p in $POLICIES; do
+		case $batt_tier in
+			4) name=CAP_T4_$p ;;
+			3) name=CAP_T3_$p ;;
+			2) name=CAP_T2_$p ;;
+			1) name=CAP_T1_$p ;;
+			*) name="" ;;
+		esac
+		if [ -n "$name" ]; then
+			want=${!name}
+			# Never raise an externally imposed lower ceiling.
+			[ "$want" -gt "${BASE[$p]}" ] && want=${BASE[$p]}
+		else
+			want=${BASE[$p]}
+		fi
+		freq=$(pick_freq "$p" "$want")
+		cur=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+		need=0
+		if [ "$freq" != "${REQUESTED[$p]}" ]; then
+			need=1
+		elif [ "$MODE" = enforce ] && [ "$batt_tier" -gt 0 ] && [ -n "$cur" ] && \
+		     [ "$cur" -gt "$freq" ] && [ $((now - ${LAST_REAPPLY[$p]:-0})) -ge 5 ]; then
+			# Something else raised the ceiling while a cap is active.
+			need=1
+			LAST_REAPPLY[$p]=$now
+		fi
+		if [ "$need" = 1 ]; then
+			if [ "$MODE" = enforce ]; then
+				if echo "$freq" > "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq" 2>/dev/null; then
+					back=$(num_file "/sys/devices/system/cpu/cpufreq/policy$p/scaling_max_freq")
+					APPLIED[$p]=${back:-$freq}
+					REQUESTED[$p]=$freq
+					jlog "p$p max ${cur:-?} -> ${APPLIED[$p]} kHz (tier $batt_tier, target ${want})"
+				else
+					jlog "p$p max write failed: $freq kHz (tier $batt_tier)"
+				fi
+			else
+				REQUESTED[$p]=$freq
+				APPLIED[$p]=$freq
+				jlog "p$p max ${cur:-?} -> $freq kHz (tier $batt_tier, target ${want}) [dry-run]"
+			fi
+		fi
+	done
+
+	# ---- charge current ----
+	chg_pct=100
+	if [ "$st" = Charging ]; then
+		case $batt_tier in
+			4) chg_pct=$CHG_PCT_4 ;;
+			3) chg_pct=$CHG_PCT_3 ;;
+			2) chg_pct=$CHG_PCT_2 ;;
+			1) chg_pct=$CHG_PCT_1 ;;
+		esac
+		[ "$bt" -ge "$BATT_CRITICAL" ] && chg_pct=0
+	fi
+	if [ "$MODE" = enforce ]; then
+		chg_max=$(num_file "$BATT/constant_charge_current_max")
+		[ -n "$chg_max" ] && CHG_MAX_LAST=$chg_max
+		if [ -n "${CHG_MAX_LAST:-}" ]; then
+			want=$((CHG_MAX_LAST * chg_pct / 100))
+			real=$(num_file "$BATT/constant_charge_current")
+			if [ -n "$real" ] && [ "$want" != "$real" ]; then
+				if [ "$chg_pct" -eq 0 ] || [ $((now - LAST_CHG_CHANGE)) -ge "$CHG_WRITE_INTERVAL" ]; then
+					if echo "$want" > "$BATT/constant_charge_current" 2>/dev/null; then
+						LAST_CHG_CHANGE=$now
+						[ "$chg_pct" -eq 100 ] && CHG_OWNED=0 || CHG_OWNED=1
+						jlog "charge current $real -> $want uA (batt=${bt}mC ${st}, tier $batt_tier, ${chg_pct}%)"
+					else
+						jlog "charge current write failed: $want uA"
+					fi
+				fi
+			fi
+		fi
+	fi
+
+	# ---- state snapshot for the tray applet ----
+	{
+		printf 'time=%s\n' "$now"
+		printf 'mode=%s\n' "$MODE"
+		printf 'batt_temp=%s\n' "$bt"
+		printf 'batt_status=%s\n' "$st"
+		printf 'batt_tier=%s\n' "$batt_tier"
+		printf 't1=%s\n' "$BATT_T1"
+		printf 't2=%s\n' "$BATT_T2"
+		printf 't3=%s\n' "$BATT_T3"
+		printf 'chg_pct=%s\n' "$chg_pct"
+		printf 'cap0=%s\n' "${APPLIED[0]}"
+		printf 'cap1=%s\n' "${APPLIED[1]}"
+		printf 'cap3=%s\n' "${APPLIED[3]}"
+		printf 'cap5=%s\n' "${APPLIED[5]}"
+	} > "$STATEFILE.tmp" 2>/dev/null && mv -f "$STATEFILE.tmp" "$STATEFILE" 2>/dev/null
+
+	tlog "${bt:-0},${st:-unknown},${batt_tier},${APPLIED[0]},${APPLIED[1]},${APPLIED[3]},${APPLIED[5]},${chg_pct}"
+
+	loop_i=$((loop_i + 1))
+	first_iter=0
+	sleep 1
+done

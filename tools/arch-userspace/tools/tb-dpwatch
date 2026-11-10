@@ -1,0 +1,19 @@
+#!/bin/sh
+L=/var/log/tb-dpwatch.log
+: > "$L"; sync
+start=$(cut -d. -f1 /proc/uptime); end=$((start + 180))
+prev=$(awk '/dp_display_isr/{print $2}' /proc/interrupts)
+prevphy=$(awk '/dp_hs_phy_irq/{print $2}' /proc/interrupts)
+while [ "$(cut -d. -f1 /proc/uptime)" -lt "$end" ]; do
+	isr=$(awk '/dp_display_isr/{print $2}' /proc/interrupts)
+	phy=$(awk '/dp_hs_phy_irq/{print $2}' /proc/interrupts)
+	st=$(cat /sys/class/drm/card1-DP-1/status 2>/dev/null)
+	en=$(cat /sys/class/drm/card1-DP-1/enabled 2>/dev/null)
+	dm=$(cat /sys/class/drm/card1-DP-1/dpms 2>/dev/null)
+	cur=$(cat /sys/class/power_supply/battery/current_now 2>/dev/null)
+	echo "$(date +%H:%M:%S) up=$(cut -d. -f1 /proc/uptime) isr=$isr(+$((isr-prev))) phy=$phy(+$((phy-prevphy))) $st/$en/$dm cur=$cur" >> "$L"
+	sync
+	prev=$isr; prevphy=$phy
+	sleep 1
+done
+echo END >> "$L"; sync

@@ -1,0 +1,14 @@
+#!/bin/sh
+L=/var/log/tb-cycle.log
+: > "$L"; sync
+for i in 1 2 3; do
+	echo "=== cycle $i start uptime=$(cut -d. -f1 /proc/uptime) boot=$(cat /proc/sys/kernel/random/boot_id)" >> "$L"
+	sync
+	rtcwake -m no -s 20
+	systemctl suspend
+	sleep 6
+	echo "=== cycle $i resumed uptime=$(cut -d. -f1 /proc/uptime) boot=$(cat /proc/sys/kernel/random/boot_id) dp=$(cat /sys/class/drm/card1-DP-1/status)/$(cat /sys/class/drm/card1-DP-1/enabled)" >> "$L"
+	sync
+done
+echo DONE >> "$L"
+sync

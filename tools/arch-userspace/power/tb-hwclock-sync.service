@@ -1,0 +1,5 @@
+[Unit]
+Description=TB710FU: re-anchor RTC SDAM offset from system clock
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/hwclock --systohc

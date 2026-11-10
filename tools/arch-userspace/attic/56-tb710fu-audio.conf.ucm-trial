@@ -1,0 +1,12 @@
+# TB710FU: UCM profile now exists (HiFi: Speaker / HDMI / Mic).
+# pro-audio kept only for fallback via the speaker node rule below.
+monitor.alsa.rules = [
+  {
+    matches = [ { device.name = "alsa_card.platform-sound" } ]
+    actions = { update-props = { api.alsa.use-ucm = true, api.alsa.split-enable = false, api.acp.auto-profile = false, api.acp.auto-port = false } }
+  }
+  {
+    matches = [ { node.name = "alsa_output.platform-sound.pro-output-0" } ]
+    actions = { update-props = { node.description = "TB710FU 扬声器", node.nick = "Speakers", priority.session = 2000, priority.driver = 2000, audio.format = "S16LE", audio.rate = 48000, audio.channels = 2, api.alsa.period-size = 1024, session.suspend-timeout-seconds = 0 } }
+  }
+]

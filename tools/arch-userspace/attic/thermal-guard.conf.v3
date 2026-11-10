@@ -1,0 +1,43 @@
+# /etc/tb710fu/thermal-guard.conf  (v3 battery tiers)
+# Values in millidegrees Celsius unless noted.
+
+# --- closed-loop control ---
+TARGET=88000            # CPU control target
+BAND=2000               # hold band: TARGET +/- BAND
+HARD_HIGH=96000         # above this, step two states per tick
+EMA_ALPHA=35            # percent weight of each new sample (tau ~ 2-3 s)
+MIN_HOLD=8              # seconds after an attack before any release
+RELEASE_INTERVAL=3      # default seconds between single release steps
+
+# --- battery temperature tiers (all have 0.5 C exit hysteresis) ---
+BATT_T1=38000           # 38.0 C yellow
+BATT_T2=39000           # 39.0 C red
+BATT_T3=40000           # 40.0 C purple
+BATT_EMERG=40500        # 40.5 C emergency: CPU clamped to per-cluster floor
+BATT_HARD_STOP=40900    # 40.9 C last resort: stop charging (end threshold)
+BATT_CRITICAL=40900     # 40.9 C last resort: constant_charge_current=0 too
+BATT_EXIT_HYST=500      # 0.5 C hysteresis on the way down
+
+# tier -> effective target band shift (lower target = earlier, harder throttling)
+SHIFT_1=3000
+SHIFT_2=5000
+SHIFT_3=8000
+SHIFT_EMERG=12000
+
+# tier -> cooling-device states added per attack tick
+ATTACK_STEP_1=1
+ATTACK_STEP_2=2
+ATTACK_STEP_3=2
+ATTACK_STEP_EMERG=3
+
+# tier -> seconds between release steps (higher = stays throttled longer)
+RELEASE_INT_1=3
+RELEASE_INT_2=5
+RELEASE_INT_3=10
+RELEASE_INT_EMERG=20
+
+# charge-current caps (percent of constant_charge_current_max) while charging
+CHG_PCT_1=50
+CHG_PCT_2=25
+CHG_PCT_3=10
+CHG_PCT_4=2

@@ -1,0 +1,26 @@
+From 66eeef09475ca462b98117b4b38e0d45a0a54a83 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 05:56:02 +0000
+Subject: [PATCH 7/8] tb710fu: initramfs.list: use the /w/initramfs build paths
+
+The build container mounts the initramfs at /w/initramfs; the old /build/linux-7.2.6/../initramfs path no longer exists. No content change.
+---
+ initramfs.list | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/initramfs.list b/initramfs.list
+index 77f53ab6e..7c980a354 100644
+--- a/initramfs.list
++++ b/initramfs.list
+@@ -6,7 +6,7 @@ dir /sys 755 0 0
+ dir /tmp 1777 0 0
+ dir /run 755 0 0
+ dir /newroot 755 0 0
+-file /bin/busybox /build/linux-7.2.6/../initramfs/busybox 755 0 0
+-file /init /build/linux-7.2.6/../initramfs/init 755 0 0
+-file /diag.sh /build/linux-7.2.6/../initramfs/diag.sh 755 0 0
+-file /nbdroot.sh /build/linux-7.2.6/../initramfs/nbdroot.sh 755 0 0
++file /bin/busybox /w/initramfs/busybox 755 0 0
++file /init /w/initramfs/init 755 0 0
++file /diag.sh /w/initramfs/diag.sh 755 0 0
++file /nbdroot.sh /w/initramfs/nbdroot.sh 755 0 0

@@ -1,0 +1,31 @@
+From f7eb84847032800cdec0a0c568d7c2e32709196a Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 05:56:02 +0000
+Subject: [PATCH 22/27] tb710fu: msm: do not block the GEM shrinker on GPU
+ fences
+
+wait_for_idle() waited up to 10 ms per object in the reclaim path. On this device a GL client can hold a fence long enough to pin kswapd for 10-18 s, and while kswapd sleeps nothing can be reclaimed. A shrinker must not block: use dma_resv_test_signaled() and skip busy objects.
+---
+ drivers/gpu/drm/msm/msm_gem_shrinker.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_shrinker.c b/drivers/gpu/drm/msm/msm_gem_shrinker.c
+index 9d2788f79..29c2bfa49 100644
+--- a/drivers/gpu/drm/msm/msm_gem_shrinker.c
++++ b/drivers/gpu/drm/msm/msm_gem_shrinker.c
+@@ -129,7 +129,14 @@ static bool
+ wait_for_idle(struct drm_gem_object *obj)
+ {
+ 	enum dma_resv_usage usage = DMA_RESV_USAGE_BOOKKEEP;
+-	return dma_resv_wait_timeout(obj->resv, usage, false, 10) > 0;
++
++	/*
++	 * TB710FU: a shrinker must never block on a driver fence. Waiting here
++	 * pins kswapd (or whichever task is allocating) for as long as the LRU
++	 * scan takes, and while kswapd sleeps nothing can be reclaimed, so the
++	 * whole system stalls. Skipping a busy buffer is the correct behaviour.
++	 */
++	return dma_resv_test_signaled(obj->resv, usage);
+ }
+ 
+ static bool

@@ -1,0 +1,1 @@
+ACTION=="change", SUBSYSTEM=="drm", KERNEL=="card*-DP-*", RUN+="/usr/bin/systemctl --no-block restart tb-dp-audio.service"

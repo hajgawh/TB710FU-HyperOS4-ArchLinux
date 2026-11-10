@@ -1,0 +1,126 @@
+From 9d90f4e5b60119df0c9669c375bb2cc9dc9904d4 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:04:27 +0000
+Subject: [PATCH 14/27] tb710fu: DTS for RTC SDAM, WCD capture, DP DAI, micbias
+
+---
+ .../dts/qcom/sm8650-lenovo-tb710fu-kshim.dts  | 68 ++++++++++++++++++-
+ .../boot/dts/qcom/sm8650-lenovo-tb710fu.dts   |  5 +-
+ 2 files changed, 70 insertions(+), 3 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
+index 7b203b211..209e62fba 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu-kshim.dts
+@@ -33,7 +33,25 @@
+  * sy7758, aw37503, dispcc_sm8550, gpucc_sm8650) and stay blacklisted on the rootfs
+  * until the native panel is proven: an enabled-but-unprobed node leaves ABL's
+  * scanout alone (same as dispcc), so simpledrm keeps working. */
+-&iris { status = "disabled"; };
++&iris { status = "okay"; };  /* enable iris video decoder (vpu33 fw from linux-firmware) */
++
++/* RTC (experiment B, 10/30): experiment A proved the SPMI arbiter denies
++ * APPS writes to the PMK8550 RTC registers ("disallowed SPMI write to
++ * sid=0, addr=0x6146" -> -EPERM), so allow-set-time cannot work.  Use the
++ * mainline offset scheme instead: the driver stores (wallclock - raw RTC
++ * counter) in a 4-byte SDAM cell and adds it back on every read.
++ * SDAM@0x7100 is APPS-writable (verified from userspace) and the cell sits
++ * at 0x7C, clear of reboot-reason@0x48.  See TB710FU-RTC持久化修复 report §6. */
++&pmk8550_sdam_2 {
++	rtc_offset: rtc-offset@7c {
++		reg = <0x7c 0x4>;
++	};
++};
++
++&pmk8550_rtc {
++	nvmem-cells = <&rtc_offset>;
++	nvmem-cell-names = "offset";
++};
+ 
+ /* USB: dual role via pmic-glink UCSI (needs the ADSP, now running):
+  * device role towards a PC (NCM console), host role on an OTG adapter/hub. */
+@@ -137,6 +155,19 @@
+ 		pinctrl-0 = <&tdm1_clk_active &tdm1_ws_active &tdm1_din_active &tdm1_dout_active>;
+ 		pinctrl-1 = <&tdm1_clk_sleep &tdm1_ws_sleep &tdm1_din_sleep &tdm1_dout_sleep>;
+ 
++		/* Mic capture (v12 mic-fix, restored 2026-11-03): canonical
++		 * upstream sm8650-qrd/hdk routing.  Without it no DAPM path
++		 * connects the ADCs to MIC BIAS, so recording captures silence. */
++		audio-routing = "AMIC1", "MIC BIAS1",
++				"AMIC2", "MIC BIAS2",
++				"AMIC3", "MIC BIAS3",
++				"AMIC4", "MIC BIAS3",
++				"AMIC5", "MIC BIAS4",
++				"TX SWR_INPUT0", "ADC1_OUTPUT",
++				"TX SWR_INPUT1", "ADC2_OUTPUT",
++				"TX SWR_INPUT2", "ADC3_OUTPUT",
++				"TX SWR_INPUT3", "ADC4_OUTPUT";
++
+ 		aw-spk-dai-link {
+ 			link-name = "AW882xx Playback";
+ 			cpu {
+@@ -152,6 +183,41 @@
+ 				sound-dai = <&q6apm>;
+ 			};
+ 		};
++
++		/* Capture BE (v12 mic-fix, restored 2026-11-03).
++		 * swr2 declares qcom,dout-ports = <1>: DAI 0 (SDW Pin0) is
++		 * playback-only, capture lives on DAI 1..4.  Using <&swr2 0>
++		 * makes ASoC drop the codec DAI for the capture direction, so
++		 * qcom_swrm_hw_params()/sdw_stream_add_master() never run and
++		 * the SWR master port registers stay 0.  Must be <&swr2 1>. */
++		wcd-capture-dai-link {
++			link-name = "WCD Capture";
++			cpu {
++				sound-dai = <&q6apmbedai TX_CODEC_DMA_TX_3>;
++			};
++			codec {
++				sound-dai = <&wcd939x 1>, <&swr2 1>, <&lpass_txmacro 0>;
++			};
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
++
++		dp-dai-link {
++			link-name = "DisplayPort Playback";
++
++			cpu {
++				sound-dai = <&q6apmbedai DISPLAY_PORT_RX_0>;
++			};
++
++			codec {
++				sound-dai = <&mdss_dp0>;
++			};
++
++			platform {
++				sound-dai = <&q6apm>;
++			};
++		};
+ 	};
+ };
+ 
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+index 332ccb4fa..3bcd043e1 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+@@ -124,7 +124,9 @@
+ 		pinctrl-names = "default";
+ 
+ 		qcom,micbias1-microvolt = <1800000>;
+-		qcom,micbias2-microvolt = <1800000>;
++		/* Headset mic needs 2.7 V (built-in AMIC1/3 stay on 1.8 V).
++		 * v12 mic-fix value, restored 2026-11-03. */
++		qcom,micbias2-microvolt = <2700000>;
+ 		qcom,micbias3-microvolt = <1800000>;
+ 		qcom,micbias4-microvolt = <1800000>;
+ 		qcom,mbhc-buttons-vthreshold-microvolt = <75000 150000 237000 500000 500000 500000 500000 500000>;
+@@ -728,7 +730,6 @@
+ &iris {
+ 	status = "okay";
+ 
+-	firmware-name = "qcom/sm8650/xiaoxin/gt/vpu33_4v.mbn";
+ };
+ 
+ &mdss {

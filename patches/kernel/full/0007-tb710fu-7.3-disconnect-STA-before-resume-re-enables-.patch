@@ -1,0 +1,116 @@
+From fea9ba7d1e844d2bd152a2fc975b262416f08e31 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Tue, 27 Oct 2026 05:36:50 +0000
+Subject: [PATCH 07/27] tb710fu 7.3: disconnect STA before resume re-enables
+ keys
+
+---
+ drivers/net/wireless/ath/ath12k/mac.c | 14 ++++++++++++++
+ include/net/mac80211.h                | 12 ++++++++++++
+ net/mac80211/ieee80211_i.h            |  3 +++
+ net/mac80211/util.c                   | 16 ++++++++++++++++
+ 4 files changed, 45 insertions(+)
+
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index d518e3582..10c07bf17 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -15308,6 +15308,18 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
+ 	return 0;
+ }
+ 
++static void ath12k_mac_resume_disconnect(struct ieee80211_hw *hw)
++{
++	struct ieee80211_vif *vif;
++
++	lockdep_assert_wiphy(hw->wiphy);
++
++	for_each_interface(vif, hw, 0) {
++		if (vif->type == NL80211_IFTYPE_STATION && vif->cfg.assoc)
++			ieee80211_resume_disconnect(vif);
++	}
++}
++
+ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ {
+ 	struct ieee80211_hw *hw = ah->hw;
+@@ -15554,6 +15566,8 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
+ 	for_each_ar(ah, ar, i)
+ 		complete_all(&ar->regd_update_completed);
+ 
++	ieee80211_set_resume_disconnect(hw, ath12k_mac_resume_disconnect);
++
+ 	ret = ieee80211_register_hw(hw);
+ 	if (ret) {
+ 		ath12k_err(ab, "ieee80211 registration failed: %d\n", ret);
+diff --git a/include/net/mac80211.h b/include/net/mac80211.h
+index ed6a5874f..291ebc046 100644
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -7079,6 +7079,18 @@ void ieee80211_disconnect(struct ieee80211_vif *vif, bool reconnect);
+  */
+ void ieee80211_resume_disconnect(struct ieee80211_vif *vif);
+ 
++/**
++ * ieee80211_set_resume_disconnect - set resume disconnect callback
++ * @hw: the hardware
++ * @cb: callback invoked before keys are re-enabled during resume
++ *
++ * The callback runs under the wiphy mutex. Drivers that cannot keep
++ * keys across suspend can use it to call ieee80211_resume_disconnect()
++ * for station interfaces.
++ */
++void ieee80211_set_resume_disconnect(struct ieee80211_hw *hw,
++				     void (*cb)(struct ieee80211_hw *hw));
++
+ /**
+  * ieee80211_hw_restart_disconnect - disconnect from AP after
+  * hardware restart
+diff --git a/net/mac80211/ieee80211_i.h b/net/mac80211/ieee80211_i.h
+index 9374c2942..041975ffe 100644
+--- a/net/mac80211/ieee80211_i.h
++++ b/net/mac80211/ieee80211_i.h
+@@ -1519,6 +1519,9 @@ struct ieee80211_local {
+ 	/* suspending is true during the whole suspend process */
+ 	bool suspending;
+ 
++	/* Called before keys are re-enabled during resume reconfig. */
++	void (*resume_disconnect)(struct ieee80211_hw *hw);
++
+ 	/*
+ 	 * Resuming is true while suspended, but when we're reprogramming the
+ 	 * hardware -- at that time it's allowed to use ieee80211_queue_work()
+diff --git a/net/mac80211/util.c b/net/mac80211/util.c
+index a96078a6b..1645b8b85 100644
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2259,6 +2259,13 @@ int ieee80211_reconfig(struct ieee80211_local *local)
+ 		}
+ 	}
+ 
++	/*
++	 * Let a driver that cannot preserve keys across suspend drop the
++	 * connection before any key is re-enabled.
++	 */
++	if (suspended && local->resume_disconnect)
++		local->resume_disconnect(hw);
++
+ 	/* add back keys */
+ 	list_for_each_entry(sdata, &local->interfaces, list)
+ 		ieee80211_reenable_keys(sdata);
+@@ -2432,6 +2439,15 @@ void ieee80211_resume_disconnect(struct ieee80211_vif *vif)
+ }
+ EXPORT_SYMBOL_GPL(ieee80211_resume_disconnect);
+ 
++void ieee80211_set_resume_disconnect(struct ieee80211_hw *hw,
++				     void (*cb)(struct ieee80211_hw *hw))
++{
++	struct ieee80211_local *local = hw_to_local(hw);
++
++	local->resume_disconnect = cb;
++}
++EXPORT_SYMBOL_GPL(ieee80211_set_resume_disconnect);
++
+ void ieee80211_recalc_smps(struct ieee80211_sub_if_data *sdata,
+ 			   struct ieee80211_link_data *link)
+ {

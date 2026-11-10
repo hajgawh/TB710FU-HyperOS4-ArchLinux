@@ -1,0 +1,38 @@
+From 9bc581d8de98aa9f50b60e897aa39354801e76ed Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 05:56:02 +0000
+Subject: [PATCH 23/27] tb710fu: usb: typec: wcd939x-usbss: skip deferred write
+ while cable attached
+
+The deferred disconnect write exists to avoid a hard reset on real unplug. Plugging in also produces a transient DP -> USB-only transition; applying the write then lands inside the SS hub enumeration window and tears USB2 and USB3 down. Only write when orientation is NONE.
+---
+ drivers/usb/typec/mux/wcd939x-usbss.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/drivers/usb/typec/mux/wcd939x-usbss.c b/drivers/usb/typec/mux/wcd939x-usbss.c
+index e7fffec45..f49471eb3 100644
+--- a/drivers/usb/typec/mux/wcd939x-usbss.c
++++ b/drivers/usb/typec/mux/wcd939x-usbss.c
+@@ -605,6 +605,22 @@ static void tb_apply_work(struct work_struct *work)
+ 	int ret;
+ 
+ 	mutex_lock(&usbss->lock);
++
++	/*
++	 * TB710FU: this write exists to avoid a hard reset when the cable is
++	 * actually unplugged.  While a cable is being plugged in, the Type-C
++	 * state machine also reports a transient DP -> USB-only transition;
++	 * applying the write at that point lands inside the SS hub's
++	 * enumeration window and tears USB2 and USB3 down.  Only write when
++	 * the cable is really gone.
++	 */
++	if (usbss->orientation != TYPEC_ORIENTATION_NONE) {
++		pr_info("TB710FU usbss: skip deferred switch write, cable attached (orientation=%d mode=0x%lx)\n",
++			usbss->orientation, usbss->mode);
++		mutex_unlock(&usbss->lock);
++		return;
++	}
++
+ 	ret = wcd939x_usbss_set(usbss);
+ 	mutex_unlock(&usbss->lock);
+ 

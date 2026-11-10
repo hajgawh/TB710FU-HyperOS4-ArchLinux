@@ -1,0 +1,8 @@
+[Unit]
+Description=TB710FU: periodic RTC offset refresh (5 min)
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=tb-hwclock-sync.service
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,23 @@
+#!/bin/bash
+# TB710FU: switch wcd939x-usbss.ko between the shipped build and the
+# leave-DP no-op experiment build.  Needs a reboot to take effect.
+set -eu
+
+D=/lib/modules/7.3.0-tb710fu/kernel/drivers/usb/typec/mux
+
+case "${1:-}" in
+cur)  SRC="$D/wcd939x-usbss.ko.dbg.bak" ;;   # shipped build (with TB710FU prints)
+noop) SRC="$D/wcd939x-usbss.ko.noop" ;;      # leave-DP register writes skipped
+abort) SRC="$D/wcd939x-usbss.ko.abort" ;;    # route B': abort DP stream first (cabfe4a3)
+*)
+	echo "usage: $0 cur|noop|abort"
+	exit 1
+	;;
+esac
+
+[ -f "$SRC" ] || { echo "missing $SRC"; exit 1; }
+
+install -m644 "$SRC" "$D/wcd939x-usbss.ko"
+depmod -a 7.3.0-tb710fu
+echo "active: $(sha256sum "$D/wcd939x-usbss.ko" | cut -d' ' -f1)"
+echo "reboot to take effect"

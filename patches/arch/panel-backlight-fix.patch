@@ -1,0 +1,32 @@
+diff --git a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+index c5e239fd4..2383ffa89 100644
+--- a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
++++ b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+@@ -400,6 +400,7 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
+ 	struct device_node *dsi1;
+ 	struct mipi_dsi_host *dsi1_host;
+ 	struct panel_info *pinfo;
++	struct backlight_device *backlight;
+ 	const struct mipi_dsi_device_info *info;
+ 	int i, ret;
+ 
+@@ -460,9 +461,16 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
+ 
+ 	pinfo->panel.prepare_prev_first = true;
+ 
+-	ret = drm_panel_of_backlight(&pinfo->panel);
+-        if (ret)
+-                return dev_err_probe(dev, ret, "Failed to get backlight\n");
++	/*
++	 * drm_panel_of_backlight() collapses to a stub returning 0 when
++	 * CONFIG_DRM=y and CONFIG_BACKLIGHT_CLASS_DEVICE=m (see
++	 * include/drm/drm_panel.h), leaving panel->backlight NULL so DPMS
++	 * off never turns the backlight off.  Look the device up directly.
++	 */
++	backlight = devm_of_find_backlight(dev);
++	if (IS_ERR(backlight))
++		return dev_err_probe(dev, PTR_ERR(backlight), "failed to get backlight\n");
++	pinfo->panel.backlight = backlight;
+ 
+ 	/*
+ 	 * devm_drm_panel_alloc() 只做 kzalloc + drm_panel_init，不注册；

@@ -1,0 +1,39 @@
+# TB710FU Tier B config fragment
+# 目的：把最后两个「功能性 builtin」搬到模块，让 Image 尽量接近 mainline。
+#
+# 用法（在已应用全部补丁的内核树里）：
+#   scripts/kconfig/merge_config.sh -m .config build/config-modules.fragment
+#   make -s LOCALVERSION= olddefconfig
+#
+# 依赖已核对（Linux 7.3 Kconfig）：
+#   PHY_QCOM_QMP_COMBO : tristate, depends on TYPEC || TYPEC=n, DRM || DRM=n
+#   QCOM_PMIC_GLINK    : tristate, depends on RPMSG/TYPEC/DRM/NET/OF/ARM64
+#   TYPEC/DRM/RPMSG 均为 =y，故两者可安全改为 =m。
+
+# ---- Tier B: 搬出 Image ----
+CONFIG_PHY_QCOM_QMP_COMBO=m
+CONFIG_QCOM_PMIC_GLINK=m
+
+# ---- 类/核心保持 builtin ----
+CONFIG_TYPEC=y
+CONFIG_DRM=y
+CONFIG_RPMSG=y
+CONFIG_PHY_QCOM_QMP=y
+
+# ---- 已经是模块的板级驱动（显式写出，防止 olddefconfig 漂移）----
+CONFIG_DRM_MSM=m
+CONFIG_DRM_PANEL_NT36532_WQHD_DUAL_DSI=m
+CONFIG_BACKLIGHT_SY7758=m
+CONFIG_TOUCHSCREEN_NT36XXX_SPI=m
+CONFIG_SND_SOC_AW882XX=m
+CONFIG_SND_SOC_SC8280XP=m
+CONFIG_SND_SOC_QDSP6=m
+CONFIG_VIDEO_QCOM_IRIS=m
+CONFIG_ATH12K=m
+CONFIG_BATTERY_QCOM_BATTMGR=m
+CONFIG_POWER_RESET_QCOM_PON=m
+CONFIG_TYPEC_MUX_WCD939X_USBSS=m
+
+# ---- 不建议改（Tier C）----
+# CONFIG_USB_DWC3=m
+# CONFIG_USB_DWC3_QCOM=m

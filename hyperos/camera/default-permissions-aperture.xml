@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Pre-grant the camera app's runtime permissions on first boot.  Aperture is
+     the only camera handler on TB710FU: MiuiCamera's JPEG path needs Xiaomi's
+     vendor campostproc service, which the frozen Lenovo vendor does not have. -->
+<permissions>
+    <exception package="org.lineageos.aperture.dev">
+        <permission name="android.permission.CAMERA" fixed="false" />
+        <permission name="android.permission.RECORD_AUDIO" fixed="false" />
+        <permission name="android.permission.ACCESS_FINE_LOCATION" fixed="false" />
+        <permission name="android.permission.ACCESS_COARSE_LOCATION" fixed="false" />
+    </exception>
+</permissions>

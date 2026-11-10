@@ -1,0 +1,112 @@
+From 15effa976732a7d58c4cea809e1e723ce0de472e Mon Sep 17 00:00:00 2001
+From: tb710fu <tb710fu@local>
+Date: Tue, 27 Oct 2026 08:09:34 +0000
+Subject: [PATCH 09/27] tb710fu 7.3: gate touch FW health work on panel power
+
+The NT36532 touch half shares the panel rails; while the panel is unprepared the die is unpowered and every probe/re-flash failed, hammering SPI for the whole blank window and racing the SPI suspend. Look the panel up lazily and skip health checks unless drm_panel is prepared. Cancel the work across system suspend and re-arm it on resume.
+
+Also create ath12k_tb_ps as WQ_UNBOUND; 7.3 warns and force-converts an unbound/percpu-less workqueue.
+---
+ .../input/touchscreen/NT36XXX_SPI/nt36xxx.c   | 45 +++++++++++++++++++
+ drivers/net/wireless/ath/ath12k/mac.c         |  2 +-
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+index f0b0583c0..27d34086a 100644
+--- a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
++++ b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+@@ -26,6 +26,7 @@
+ #include <linux/irqdomain.h>
+ #include "nt36xxx.h"
+ #include <linux/gpio/consumer.h>
++#include <drm/drm_panel.h>
+ /* Kirby code for KIRBYU-960 by liaoxg1 at 2024/4/26 start */
+ /* Kirby code for KIRBYU-960 by liaoxg1 at 2024/4/26 end */
+ 
+@@ -282,8 +283,47 @@ static int nvt_fw_alive_probe(void)
+ 	return -1;
+ }
+ 
++/* TB710FU: the NT36532 touch half shares the panel rails.  Once the
++ * panel is unprepared its die is unpowered, so probing and re-flashing
++ * can never succeed and merely hammer SPI for the whole blank window.
++ * Look the panel up lazily (the panel module is loaded by a systemd
++ * service after us) and let drm_panel's own prepared state gate the
++ * health check. */
++static struct drm_panel *tb710fu_panel;
++
++static bool tb710fu_panel_is_on(void)
++{
++	struct device_node *np = ts->client->dev.of_node;
++	struct device_node *panel_np;
++	struct drm_panel *panel;
++	int count, i;
++
++	if (ts->dev_pm_suspend)
++		return false;
++
++	if (!tb710fu_panel && np) {
++		count = of_count_phandle_with_args(np, "panel", NULL);
++		for (i = 0; i < count; i++) {
++			panel_np = of_parse_phandle(np, "panel", i);
++			if (!panel_np)
++				continue;
++			panel = of_drm_find_panel(panel_np);
++			of_node_put(panel_np);
++			if (!IS_ERR(panel)) {
++				tb710fu_panel = panel;
++				break;
++			}
++		}
++	}
++
++	return !tb710fu_panel || tb710fu_panel->prepared;
++}
++
+ static void nvt_fw_health_work(struct work_struct *work)
+ {
++	if (!tb710fu_panel_is_on())
++		goto out;
++
+ 	if (nvt_fw_alive_probe()) {
+ 		NVT_ERR("fw health: touch FW dead, re-flashing\n");
+ 		mutex_lock(&ts->lock);
+@@ -291,6 +331,7 @@ static void nvt_fw_health_work(struct work_struct *work)
+ 		mutex_unlock(&ts->lock);
+ 		nvt_irq_enable(true);
+ 	}
++out:
+ 	queue_delayed_work(system_wq, &nvt_fw_health_dwork,
+ 			   msecs_to_jiffies(5000));
+ }
+@@ -3936,6 +3977,7 @@ static int nvt_mtk_drm_notifier_callback(struct notifier_block *nb,
+ #if NVT_PM_WAIT_BUS_RESUME_COMPLETE
+ static int nvt_ts_pm_suspend(struct device *dev)
+ {
++	cancel_delayed_work_sync(&nvt_fw_health_dwork);
+ 	ts->dev_pm_suspend = true;
+ #ifdef BUILD_LAPIS_TOUCH
+ #if NVT_HALL_CHECK
+@@ -3950,6 +3992,9 @@ static int nvt_ts_pm_resume(struct device *dev)
+ {
+ 	ts->dev_pm_suspend = false;
+ 	complete(&ts->dev_pm_resume_completion);
++	/* Bus and panel are back; re-check the touch die shortly. */
++	queue_delayed_work(system_wq, &nvt_fw_health_dwork,
++			   msecs_to_jiffies(1000));
+ #ifdef BUILD_LAPIS_TOUCH
+ #if NVT_HALL_CHECK
+ 	printk("%s:++\n", __func__);
+diff --git a/drivers/net/wireless/ath/ath12k/mac.c b/drivers/net/wireless/ath/ath12k/mac.c
+index 10c07bf17..651421ff8 100644
+--- a/drivers/net/wireless/ath/ath12k/mac.c
++++ b/drivers/net/wireless/ath/ath12k/mac.c
+@@ -4245,7 +4245,7 @@ static void ath12k_bss_assoc(struct ath12k *ar,
+ 			tb710fu_ps_work_inited = true;
+ 		}
+ 		if (!tb710fu_ps_wq)
+-			tb710fu_ps_wq = alloc_workqueue("ath12k_tb_ps", 0, 0);
++			tb710fu_ps_wq = alloc_workqueue("ath12k_tb_ps", WQ_UNBOUND, 0);
+ 		tb710fu_ps_ar = ar;
+ 		tb710fu_ps_vdev_id = arvif->vdev_id;
+ 		tb710fu_ps_on = true;

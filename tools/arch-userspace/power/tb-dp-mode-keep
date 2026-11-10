@@ -1,0 +1,242 @@
+#!/bin/bash
+# TB710FU: keep DP-1 on a timing that actually fits the negotiated link.
+#
+# The Redmi A27U rejects 6 bpc, and the DP driver silently drops to 6 bpc
+# when the pixel clock does not fit the link.  594 MHz 4K60 needs
+# 14.26 Gbps at 24 bpp; 4-lane HBR2 has 17.28 Gbps (fits), 2-lane HBR3 has
+# only 12.96 Gbps (does not).  The kernel already hides or refuses those
+# modes on 2-lane links (msm 434d7b98+), but KWin can still carry a stale
+# saved mode, so mirror the rule here as a second gate:
+#
+#   4 lanes                 -> native 4K60 594 MHz   (leave alone once there)
+#   2 lanes, rate >= 810000 -> CVT-RB 4K60 535.68 MHz (driver-synthesized)
+#   2 lanes, rate <  810000 -> 4K30 297 MHz
+#   2 lanes, clock > 540000 -> downshift to 4K30, never 4K60/594
+#
+# Modes are addressed by kscreen id, resolved from kscreen-doctor -j by
+# size + refresh; ids shift whenever the kernel mode list changes, so never
+# hardcode one.  Override with TB_DP_MODE_ID_4LANE after a kscreen-doctor -o.
+set -u
+
+export XDG_RUNTIME_DIR=/run/user/1001
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+
+# TB_DP_STATUS / TB_DP_DPDBG / TB_DP_DRYRUN exist for offline testing only.
+DP=${TB_DP_STATUS:-/sys/class/drm/card1-DP-1/status}
+DPDBG=${TB_DP_DPDBG:-/sys/kernel/debug/dri/1/DP-1/dp_debug}
+MODE_4LANE=${TB_DP_MODE_ID_4LANE:-2}
+DRYRUN=${TB_DP_DRYRUN:-0}
+
+# 535.68 MHz CVT-RB is the only 4K60 that fits 2-lane HBR3 at 8 bpc.
+MAX_2LANE_CLOCK=540000
+CVTRB_CLOCK=535680
+NATIVE_CLOCK=594000
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+dp_connected() { [ "$(cat "$DP" 2>/dev/null)" = "connected" ]; }
+
+# print "<lanes> <rate> <pixel clock khz>" or nothing
+link_state() {
+	local lanes rate clock
+	lanes=$(grep -m1 'num_lanes =' "$DPDBG" 2>/dev/null | tr -dc '0-9')
+	rate=$(grep -m1 '^\s*rate =' "$DPDBG" 2>/dev/null | tr -dc '0-9')
+	clock=$(grep -m1 'pixel clock khz =' "$DPDBG" 2>/dev/null | tr -dc '0-9')
+	[ -n "${lanes:-}" ] && [ -n "${rate:-}" ] || return 0
+	printf '%s %s %s\n' "$lanes" "$rate" "${clock:-0}"
+}
+
+# "native" (4-lane), "cvtrb" (2-lane HBR3), "4k30" (2-lane HBR2) or "" unknown
+policy_for() {
+	local lanes=$1 rate=$2
+	if [ "$lanes" -ge 4 ]; then
+		echo native
+	elif [ "$rate" -ge 810000 ]; then
+		echo cvtrb
+	else
+		echo 4k30
+	fi
+}
+
+# resolve a kscreen mode id: pick_mode <width> <height> <min refresh> <max refresh>
+# Prints the id of the single best match, nothing if there is no unique one.
+pick_mode() {
+	local w=$1 h=$2 rmin=$3 rmax=$4
+	WAYLAND_DISPLAY="$wl_active" kscreen-doctor -j 2>/dev/null |
+		python3 -c '
+import json, sys
+w, h, rmin, rmax = int(sys.argv[1]), int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4])
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+best = None
+for o in d.get("outputs", []):
+    if o.get("name") != "DP-1":
+        continue
+    for m in o.get("modes", []):
+        s, r = m.get("size", {}), float(m.get("refreshRate", 0))
+        if s.get("width") != w or s.get("height") != h:
+            continue
+        if not (rmin <= r <= rmax):
+            continue
+        # highest refresh wins; ids are strings
+        if best is None or r > best[0]:
+            best = (r, str(m["id"]))
+if best:
+    print(best[1])
+' "$w" "$h" "$rmin" "$rmax" 2>/dev/null
+}
+
+# how many DP-1 modes are 4K at ~60 Hz (used to spot the ambiguous pre-fix list)
+count_4k60() {
+	WAYLAND_DISPLAY="$wl_active" kscreen-doctor -j 2>/dev/null |
+		python3 -c '
+import json, sys
+n = 0
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit
+for o in d.get("outputs", []):
+    if o.get("name") != "DP-1":
+        continue
+    for m in o.get("modes", []):
+        s = m.get("size", {})
+        if s.get("width") == 3840 and s.get("height") == 2160 and 59 <= float(m.get("refreshRate", 0)) <= 61:
+            n += 1
+print(n)
+' 2>/dev/null
+}
+
+apply_id() {
+	local id=$1 what=$2
+	[ -n "${id:-}" ] || { log "no kscreen mode id for $what"; return 1; }
+	if [ "$DRYRUN" = 1 ]; then
+		log "dry-run: would apply $what (mode $id)"
+		return 0
+	fi
+	log "applying $what (mode $id)"
+	WAYLAND_DISPLAY="$wl_active" kscreen-doctor "output.DP-1.mode.$id" >/dev/null 2>&1
+	return 0
+}
+
+# Verify the link after a switch; 2-lane must never sit above 540 MHz.
+verify_or_downshift() {
+	local lanes=$1 rate=$2 clock=$3
+	[ "$lanes" -eq 2 ] || return 0
+	[ "$clock" -gt "$MAX_2LANE_CLOCK" ] || return 0
+	log "still $clock kHz on 2 lanes, forcing 4K30"
+	apply_id "$(pick_mode 3840 2160 29 31)" "4K30" || return 0
+	sleep 3
+	log "after downshift: $(link_state)"
+}
+
+run_once() {
+	local state lanes rate clock policy id
+	state=$(link_state)
+	[ -n "$state" ] || { log "no dp_debug yet, leaving mode alone"; return 0; }
+	read -r lanes rate clock <<<"$state"
+	policy=$(policy_for "$lanes" "$rate")
+
+	# 4-lane: only make sure we are not stuck on a low clock.
+	if [ "$policy" = native ]; then
+		if [ "$clock" -lt 570000 ]; then
+			id=${MODE_4LANE:-}
+			apply_id "$id" "native 4K60" || return 0
+			sleep 3
+		fi
+		log "4 lanes, rate $rate, clock $clock - ok"
+		return 0
+	fi
+
+	# 2-lane: anything above 540 MHz is unrepresentable at 8 bpc.
+	if [ "$clock" -gt "$MAX_2LANE_CLOCK" ]; then
+		what=4K30
+		id=$(pick_mode 3840 2160 29 31)
+		# Pre-434d7b98 kernels kept the 59.94 Hz 593 MHz modes, so more
+		# than one 4K60 exists and we cannot tell them apart by name.
+		if [ "$policy" = cvtrb ] && [ "$(count_4k60)" = "1" ]; then
+			what="CVT-RB 4K60"
+			id=$(pick_mode 3840 2160 59 61)
+		fi
+		apply_id "$id" "$what" || return 0
+		sleep 3
+		read -r _ _ clock <<<"$(link_state)"
+		verify_or_downshift "$lanes" "$rate" "${clock:-0}"
+		return 0
+	fi
+
+	# 2-lane HBR3 already on CVT-RB: nothing to do.
+	if [ "$policy" = cvtrb ] && [ "$clock" -ge $((CVTRB_CLOCK - 1000)) ]; then
+		log "2 lanes HBR3, CVT-RB $clock kHz - ok"
+		return 0
+	fi
+
+	# 2-lane HBR3 stuck on 4K30: restore 4K60 only if the list is unambiguous.
+	if [ "$policy" = cvtrb ]; then
+		if [ "$(count_4k60)" = "1" ]; then
+			apply_id "$(pick_mode 3840 2160 59 61)" "CVT-RB 4K60" || return 0
+			sleep 3
+			read -r _ _ clock <<<"$(link_state)"
+			log "upgraded to $clock kHz"
+		else
+			log "2 lanes HBR3, $clock kHz; 4K60 list ambiguous, left alone"
+		fi
+		return 0
+	fi
+
+	log "2 lanes rate $rate, clock $clock - ok"
+	return 0
+}
+
+apply() {
+	local wl
+	wl=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep -m1 '^wayland-')
+	[ -n "$wl" ] || { log "no wayland socket yet"; return 0; }
+	wl_active=$wl
+	run_once
+}
+
+if [ "${1:-}" = "--status" ]; then
+	state=$(link_state)
+	[ -n "$state" ] || { echo "dp_debug unreadable"; exit 1; }
+	read -r lanes rate clock <<<"$state"
+	echo "lanes=$lanes rate=$rate clock=$clock policy=$(policy_for "$lanes" "$rate")"
+	exit 0
+fi
+
+if [ "${1:-}" = "--once" ]; then
+	apply
+	exit 0
+fi
+
+# initial pass (boot / service restart)
+for _ in $(seq 1 15); do
+	dp_connected && break
+	sleep 2
+done
+# TB710FU: wait out the USB2 enumeration window before touching the mode.
+if dp_connected; then
+	sleep 15
+	dp_connected && apply
+fi
+
+# Follow DP hotplug.  The kernel no longer prints anything on HPD (the
+# TB710FU pr_info storm was removed), so listen to udev instead of the
+# kernel log.  KWin may re-pick the mode a moment after the connector
+# appears, hence the second check.
+udevadm monitor --udev --subsystem-match=drm --property 2>/dev/null |
+while read -r line; do
+	case "$line" in
+	HOTPLUG=1)
+		# TB710FU: a mode change 4 s after hotplug lands inside the
+		# USB2 enumeration window and has been observed to hard-reset
+		# the tablet.  Wait it out.
+		sleep 15
+		dp_connected && apply
+		sleep 5
+		dp_connected && apply
+		;;
+	esac
+done

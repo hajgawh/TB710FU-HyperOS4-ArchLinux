@@ -1,0 +1,28 @@
+#!/bin/bash
+# TB710FU: re-enable the external DP output after plugging the cable back.
+set -eu
+
+export XDG_RUNTIME_DIR=/run/user/1001
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+
+wl=$(ls "$XDG_RUNTIME_DIR" 2>/dev/null | grep -m1 '^wayland-') || true
+if [ -z "${wl:-}" ]; then
+	echo "no wayland session found in $XDG_RUNTIME_DIR" >&2
+	exit 1
+fi
+
+[ "$(cat /sys/class/drm/card1-DP-1/status 2>/dev/null)" = "connected" ] || {
+	echo "DP-1 not connected, plug the cable first"
+	exit 1
+}
+
+# mode.2 is the 594 MHz 4K60 timing (kscreen labels are unreliable).
+WAYLAND_DISPLAY="$wl" kscreen-doctor output.DP-1.enable output.DP-1.mode.2
+sleep 2
+
+if [ "$(cat /sys/class/drm/card1-DP-1/enabled 2>/dev/null)" = "enabled" ]; then
+	echo "DP-1 enabled"
+else
+	echo "DP-1 did not come up, try: kscreen-doctor -o" >&2
+	exit 1
+fi

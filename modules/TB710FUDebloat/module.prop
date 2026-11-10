@@ -1,0 +1,6 @@
+id=tb710fu_os4_debloat
+name=TB710FU OS4 超级精简冻结
+version=v1.5.2
+versionCode=8
+author=TB710FU
+description=三级精简：①按实测内存占用冻结 30 个不用的系统服务（小爱/AI、账号云互联、负一屏/小米推送/快应用、广告统计；查找设备自动改走按用户卸载）；②组件级冻结安全中心里的反诈组件；③iptables 在 DNS 层黑洞反诈上报域名。restore/操作按钮/卸载模块均可一键恢复。

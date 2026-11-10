@@ -1,0 +1,15 @@
+[Unit]
+Description=TB710FU userspace thermal governor
+Documentation=file:///etc/tb710fu/thermal-guard.conf
+After=multi-user.target
+ConditionPathExists=/sys/class/thermal
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/tb-thermal-guard --enforce
+Restart=always
+RestartSec=2
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

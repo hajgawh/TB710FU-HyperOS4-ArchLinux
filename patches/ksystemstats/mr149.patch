@@ -1,0 +1,1002 @@
+diff --git a/plugins/gpu/CMakeLists.txt b/plugins/gpu/CMakeLists.txt
+index 894c9d3acce12e03ccbb438474dc67ba4d5c173e..706aa97fb01d877909180d401244356c800d5612 100644
+--- a/plugins/gpu/CMakeLists.txt
++++ b/plugins/gpu/CMakeLists.txt
+@@ -12,7 +12,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+     include(CheckIncludeFile)
+     check_include_file("drm/xe_drm.h" HAVE_XE_DRM_H)
+ 
+-    target_sources(ksystemstats_plugin_gpu PRIVATE LinuxAmdGpu.cpp LinuxIntelGpu.cpp LinuxNvidiaGpu.cpp LinuxBackend.cpp NvidiaGpu.cpp NvidiaSmiProcess.cpp)
++    target_sources(ksystemstats_plugin_gpu PRIVATE LinuxAmdGpu.cpp LinuxDrmFdInfo.cpp LinuxIntelGpu.cpp LinuxMsmGpu.cpp LinuxNvidiaGpu.cpp LinuxBackend.cpp NvidiaGpu.cpp NvidiaSmiProcess.cpp)
+ 
+     if(HAVE_XE_DRM_H)
+         target_sources(ksystemstats_plugin_gpu PRIVATE LinuxXeGpu.cpp)
+diff --git a/plugins/gpu/LinuxBackend.cpp b/plugins/gpu/LinuxBackend.cpp
+index 64c4eb76a86ea9b48c0a612410825e2418299838..7779b88f6a6eeb0a694addca9660e725159dc1ca 100644
+--- a/plugins/gpu/LinuxBackend.cpp
++++ b/plugins/gpu/LinuxBackend.cpp
+@@ -1,6 +1,6 @@
+ /*
+  * SPDX-FileCopyrightText: 2020 Arjen Hiemstra <ahiemstra@heimr.nl>
+- * 
++ *
+  * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+  */
+ 
+@@ -8,12 +8,21 @@
+ 
+ #include <KLocalizedString>
+ 
++#include <QFile>
++#include <QFileInfo>
++#include <QRegularExpression>
++#include <QStringList>
++
+ #include <libudev.h>
+ 
++#include <optional>
++
+ #include <processcore/gpu_utils.h>
+ 
+ #include "LinuxAmdGpu.h"
++#include "LinuxDrmFdInfo.h"
+ #include "LinuxIntelGpu.h"
++#include "LinuxMsmGpu.h"
+ #include "LinuxNvidiaGpu.h"
+ #ifdef HAVE_XE_DRM_H
+ #include "LinuxXeGpu.h"
+@@ -25,9 +34,9 @@ static const char *amdVendor = "0x1002";
+ static const char *intelVendor = "0x8086";
+ static const char *nvidiaVendor = "0x10de";
+ // PCI Device class strings
+-static const char *VGAController =      "0x030000";
+-static const char *threeDController =   "0x030200";
+-static const char *displayController =  "0x038000";
++static const char *VGAController = "0x030000";
++static const char *threeDController = "0x030200";
++static const char *displayController = "0x038000";
+ 
+ static bool isXeDriver(udev_device *pciDevice)
+ {
+@@ -35,6 +44,83 @@ static bool isXeDriver(udev_device *pciDevice)
+     return driver && strcmp(driver, "xe") == 0;
+ }
+ 
++static std::optional<LinuxDrmFdInfo> readDrmFdInfo(udev_device *drmDevice)
++{
++    const char *deviceNode = udev_device_get_devnode(drmDevice);
++    if (!deviceNode) {
++        return std::nullopt;
++    }
++
++    QFile drmNode(QString::fromLocal8Bit(deviceNode));
++    if (!drmNode.open(QIODevice::ReadOnly)) {
++        return std::nullopt;
++    }
++
++    QFile fdInfo(QStringLiteral("/proc/self/fdinfo/%1").arg(drmNode.handle()));
++    if (!fdInfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        return std::nullopt;
++    }
++
++    return parseLinuxDrmFdInfo(&fdInfo);
++}
++
++static bool isMsmGpu(udev_device *drmDevice)
++{
++    const char *devicePath = udev_device_get_syspath(drmDevice);
++    udev *udevContext = udev_device_get_udev(drmDevice);
++    if (!devicePath || !udevContext) {
++        return false;
++    }
++
++    const QString physicalDevicePath = QFileInfo(QString::fromLocal8Bit(devicePath) + QStringLiteral("/device")).canonicalFilePath();
++    if (physicalDevicePath.isEmpty()) {
++        return false;
++    }
++
++    // Render nodes are normally accessible without display-master privileges,
++    // so prefer a render node belonging to the same physical DRM device.
++    QStringList renderDevicePaths;
++    udev_enumerate *enumerate = udev_enumerate_new(udevContext);
++    if (enumerate) {
++        udev_enumerate_add_match_property(enumerate, "DEVTYPE", "drm_minor");
++        udev_enumerate_add_match_subsystem(enumerate, "drm");
++        udev_enumerate_scan_devices(enumerate);
++
++        static const QRegularExpression renderNodePattern(QStringLiteral("^renderD[0-9]+$"));
++        for (auto entry = udev_enumerate_get_list_entry(enumerate); entry; entry = udev_list_entry_get_next(entry)) {
++            const char *path = udev_list_entry_get_name(entry);
++            udev_device *candidate = udev_device_new_from_syspath(udevContext, path);
++            if (!candidate) {
++                continue;
++            }
++
++            const char *systemName = udev_device_get_sysname(candidate);
++            const char *candidatePath = udev_device_get_syspath(candidate);
++            if (systemName && candidatePath && renderNodePattern.match(QString::fromLocal8Bit(systemName)).hasMatch()
++                && QFileInfo(QString::fromLocal8Bit(candidatePath) + QStringLiteral("/device")).canonicalFilePath() == physicalDevicePath) {
++                renderDevicePaths.append(QString::fromLocal8Bit(candidatePath));
++            }
++            udev_device_unref(candidate);
++        }
++        udev_enumerate_unref(enumerate);
++    }
++
++    for (const QString &path : std::as_const(renderDevicePaths)) {
++        udev_device *renderDevice = udev_device_new_from_syspath(udevContext, QFile::encodeName(path).constData());
++        if (!renderDevice) {
++            continue;
++        }
++        const auto fdInfo = readDrmFdInfo(renderDevice);
++        udev_device_unref(renderDevice);
++        if (fdInfo && fdInfo->driver == "msm") {
++            return true;
++        }
++    }
++
++    const auto fdInfo = readDrmFdInfo(drmDevice);
++    return fdInfo && linuxMsmClientSample(*fdInfo).has_value();
++}
++
+ LinuxBackend::LinuxBackend(QObject *parent)
+     : GpuBackend(parent)
+ {
+@@ -97,6 +183,43 @@ void LinuxBackend::start()
+     }
+ 
+     udev_enumerate_unref(enumerate);
++
++    // PCI enumeration above intentionally includes headless PCI GPUs. Platform
++    // GPUs have no PCI vendor ID, so discover DRM primary nodes separately and
++    // classify them using the mandatory drm-driver fdinfo field.
++    enumerate = udev_enumerate_new(m_udev);
++    udev_enumerate_add_match_property(enumerate, "DEVTYPE", "drm_minor");
++    udev_enumerate_add_match_subsystem(enumerate, "drm");
++    udev_enumerate_scan_devices(enumerate);
++
++    static const QRegularExpression primaryNodePattern(QStringLiteral("^card[0-9]+$"));
++    devices = udev_enumerate_get_list_entry(enumerate);
++    for (auto entry = devices; entry; entry = udev_list_entry_get_next(entry)) {
++        const char *path = udev_list_entry_get_name(entry);
++        auto drmDevice = udev_device_new_from_syspath(m_udev, path);
++        if (!drmDevice) {
++            continue;
++        }
++        const char *systemName = udev_device_get_sysname(drmDevice);
++
++        if (!systemName || !primaryNodePattern.match(QString::fromLocal8Bit(systemName)).hasMatch()
++            || udev_device_get_parent_with_subsystem_devtype(drmDevice, "pci", nullptr) || !isMsmGpu(drmDevice)) {
++            udev_device_unref(drmDevice);
++            continue;
++        }
++
++        const auto gpuId = QStringLiteral("gpu%1").arg(gpuNumber);
++        const QString gpuName = i18nc("@title", "Qualcomm Adreno GPU");
++        auto gpu = new LinuxMsmGpu{gpuId, gpuName, drmDevice};
++        gpu->initialize();
++        m_devices.append(gpu);
++        Q_EMIT deviceAdded(gpu);
++        gpuNumber++;
++
++        udev_device_unref(drmDevice);
++    }
++
++    udev_enumerate_unref(enumerate);
+ }
+ 
+ void LinuxBackend::stop()
+diff --git a/plugins/gpu/LinuxDrmFdInfo.cpp b/plugins/gpu/LinuxDrmFdInfo.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a7fdaff8b4fe9f82fd4481c60cfa09f7cc5e52b9
+--- /dev/null
++++ b/plugins/gpu/LinuxDrmFdInfo.cpp
+@@ -0,0 +1,133 @@
++/*
++    SPDX-FileCopyrightText: 2026 Leon Silcott <lnsilcott@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#include "LinuxDrmFdInfo.h"
++
++#include <QIODevice>
++
++#include <algorithm>
++
++namespace
++{
++std::optional<quint64> parseUnsigned(const QByteArray &input, const QByteArray &unit = {})
++{
++    QByteArray number = input.trimmed();
++    if (!unit.isEmpty()) {
++        if (!number.endsWith(unit)) {
++            return std::nullopt;
++        }
++        number.chop(unit.size());
++        number = number.trimmed();
++    }
++
++    if (number.isEmpty() || !std::all_of(number.cbegin(), number.cend(), [](char character) {
++            return character >= '0' && character <= '9';
++        })) {
++        return std::nullopt;
++    }
++
++    bool ok = false;
++    const quint64 value = number.toULongLong(&ok);
++    if (!ok) {
++        return std::nullopt;
++    }
++    return value;
++}
++}
++
++LinuxDrmFdInfo parseLinuxDrmFdInfo(QIODevice *device)
++{
++    LinuxDrmFdInfo result;
++    if (!device || !device->isReadable()) {
++        return result;
++    }
++
++    while (true) {
++        const QByteArray line = device->readLine();
++        if (line.isNull()) {
++            break;
++        }
++        const qsizetype separator = line.indexOf(':');
++        if (separator <= 0) {
++            continue;
++        }
++
++        const QByteArray key = line.left(separator).trimmed();
++        const QByteArray value = line.mid(separator + 1).trimmed();
++
++        if (key == "drm-driver") {
++            result.driver = value;
++        } else if (key == "drm-client-id") {
++            result.clientId = parseUnsigned(value);
++        } else if (key.startsWith("drm-engine-")) {
++            const QByteArray engine = key.mid(sizeof("drm-engine-") - 1);
++            if (!engine.isEmpty()) {
++                if (const auto parsed = parseUnsigned(value, "ns")) {
++                    result.engineTime.insert(engine, *parsed);
++                }
++            }
++        }
++    }
++
++    return result;
++}
++
++std::optional<LinuxMsmClientSample> linuxMsmClientSample(const LinuxDrmFdInfo &fdInfo)
++{
++    const auto gpuEngine = fdInfo.engineTime.constFind("gpu");
++    if (fdInfo.driver != "msm" || !fdInfo.clientId || gpuEngine == fdInfo.engineTime.cend()) {
++        return std::nullopt;
++    }
++
++    return LinuxMsmClientSample{.clientId = *fdInfo.clientId, .gpuEngineTime = gpuEngine.value()};
++}
++
++void mergeLinuxMsmClientSample(QHash<quint64, quint64> &clients, const LinuxMsmClientSample &sample)
++{
++    const auto existing = clients.constFind(sample.clientId);
++    if (existing == clients.cend() || sample.gpuEngineTime > existing.value()) {
++        clients.insert(sample.clientId, sample.gpuEngineTime);
++    }
++}
++
++double LinuxDrmUsageSampler::sample(const QHash<quint64, quint64> &currentEngineTimes, qint64 elapsedNanoseconds)
++{
++    if (!m_hasBaseline) {
++        m_previousEngineTimes = currentEngineTimes;
++        m_hasBaseline = true;
++        return 0.0;
++    }
++
++    if (elapsedNanoseconds <= 0) {
++        return 0.0;
++    }
++
++    auto nextEngineTimes = currentEngineTimes;
++    long double busyNanoseconds = 0.0L;
++
++    for (auto it = currentEngineTimes.cbegin(); it != currentEngineTimes.cend(); ++it) {
++        const auto previous = m_previousEngineTimes.constFind(it.key());
++        if (previous == m_previousEngineTimes.cend()) {
++            continue;
++        }
++
++        if (it.value() < previous.value()) {
++            nextEngineTimes.insert(it.key(), previous.value());
++            continue;
++        }
++
++        busyNanoseconds += static_cast<long double>(it.value() - previous.value());
++    }
++
++    m_previousEngineTimes = nextEngineTimes;
++    return std::clamp(static_cast<double>((busyNanoseconds / static_cast<long double>(elapsedNanoseconds)) * 100.0L), 0.0, 100.0);
++}
++
++void LinuxDrmUsageSampler::reset()
++{
++    m_previousEngineTimes.clear();
++    m_hasBaseline = false;
++}
+diff --git a/plugins/gpu/LinuxDrmFdInfo.h b/plugins/gpu/LinuxDrmFdInfo.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..d25432412cb8de340efc8542b66a4643e874f7c9
+--- /dev/null
++++ b/plugins/gpu/LinuxDrmFdInfo.h
+@@ -0,0 +1,40 @@
++/*
++    SPDX-FileCopyrightText: 2026 Leon Silcott <lnsilcott@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#pragma once
++
++#include <QByteArray>
++#include <QHash>
++
++#include <optional>
++
++class QIODevice;
++
++struct LinuxDrmFdInfo {
++    QByteArray driver;
++    std::optional<quint64> clientId;
++    QHash<QByteArray, quint64> engineTime;
++};
++
++struct LinuxMsmClientSample {
++    quint64 clientId;
++    quint64 gpuEngineTime;
++};
++
++LinuxDrmFdInfo parseLinuxDrmFdInfo(QIODevice *device);
++std::optional<LinuxMsmClientSample> linuxMsmClientSample(const LinuxDrmFdInfo &fdInfo);
++void mergeLinuxMsmClientSample(QHash<quint64, quint64> &clients, const LinuxMsmClientSample &sample);
++
++class LinuxDrmUsageSampler
++{
++public:
++    double sample(const QHash<quint64, quint64> &currentEngineTimes, qint64 elapsedNanoseconds);
++    void reset();
++
++private:
++    QHash<quint64, quint64> m_previousEngineTimes;
++    bool m_hasBaseline = false;
++};
+diff --git a/plugins/gpu/LinuxMsmGpu.cpp b/plugins/gpu/LinuxMsmGpu.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..43397c3c6df9a89b4afbd1d0b1646c17ec6bd52f
+--- /dev/null
++++ b/plugins/gpu/LinuxMsmGpu.cpp
+@@ -0,0 +1,325 @@
++/*
++    SPDX-FileCopyrightText: 2026 Leon Silcott <lnsilcott@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#include "LinuxMsmGpu.h"
++
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QRegularExpression>
++
++#include <libudev.h>
++#include <sys/stat.h>
++
++#include <systemstats/SensorProperty.h>
++
++namespace
++{
++constexpr double hertzPerMegahertz = 1'000'000.0;
++constexpr qint64 clientDiscoveryIntervalMilliseconds = 2000;
++
++QString canonicalDevicePath(const QString &drmPath)
++{
++    return QFileInfo(drmPath + QStringLiteral("/device")).canonicalFilePath();
++}
++
++bool addDeviceNumber(udev_device *device, QSet<quint64> &deviceNumbers)
++{
++    const dev_t deviceNumber = udev_device_get_devnum(device);
++    if (deviceNumber == 0) {
++        return false;
++    }
++
++    deviceNumbers.insert(static_cast<quint64>(deviceNumber));
++    return true;
++}
++
++bool isAdrenoDevfreq(const QString &path)
++{
++    QFile uevent(path + QStringLiteral("/device/uevent"));
++    if (uevent.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        const auto entries = uevent.readAll().split('\n');
++        if (entries.contains(QByteArrayLiteral("DRIVER=adreno"))) {
++            return true;
++        }
++    }
++
++    QFile compatible(path + QStringLiteral("/device/of_node/compatible"));
++    if (!compatible.open(QIODevice::ReadOnly)) {
++        return false;
++    }
++
++    for (const QByteArray &entry : compatible.readAll().split('\0')) {
++        if (entry == QByteArrayLiteral("qcom,adreno") || entry.startsWith(QByteArrayLiteral("qcom,adreno-"))) {
++            return true;
++        }
++    }
++    return false;
++}
++}
++
++LinuxMsmGpu::LinuxMsmGpu(const QString &id, const QString &name, udev_device *device)
++    : GpuDevice(id, name)
++{
++    discoverDeviceNumbers(device);
++    m_devfreqPath = findDevfreqPath(device);
++}
++
++void LinuxMsmGpu::initialize()
++{
++    GpuDevice::initialize();
++
++    m_usageProperty->setValue(0.0);
++
++    bool ok = false;
++    const double minimumMhz = readFrequencyMhz(QStringLiteral("min_freq"), &ok);
++    if (ok) {
++        m_coreFrequencyProperty->setMin(minimumMhz);
++    }
++
++    const double maximumMhz = readFrequencyMhz(QStringLiteral("max_freq"), &ok);
++    if (ok) {
++        m_coreFrequencyProperty->setMax(maximumMhz);
++    }
++
++    const double currentMhz = readFrequencyMhz(QStringLiteral("cur_freq"), &ok);
++    if (ok) {
++        m_coreFrequencyProperty->setValue(currentMhz);
++    }
++
++    connect(m_usageProperty, &KSysGuard::SensorProperty::subscribedChanged, this, [this](bool subscribed) {
++        m_usageSubscribed = subscribed;
++        m_clientDescriptors.clear();
++        m_clientDiscoveryTimer.invalidate();
++        m_usageSampler.reset();
++        m_usageTimer.invalidate();
++        if (subscribed) {
++            m_usageTimer.start();
++        }
++    });
++    connect(m_coreFrequencyProperty, &KSysGuard::SensorProperty::subscribedChanged, this, [this](bool subscribed) {
++        m_frequencySubscribed = subscribed;
++    });
++}
++
++void LinuxMsmGpu::update()
++{
++    if (m_frequencySubscribed) {
++        bool ok = false;
++        const double currentMhz = readFrequencyMhz(QStringLiteral("cur_freq"), &ok);
++        if (ok) {
++            m_coreFrequencyProperty->setValue(currentMhz);
++        }
++    }
++
++    if (!m_usageSubscribed || !m_usageTimer.isValid()) {
++        return;
++    }
++
++    const bool discoverClients = !m_clientDiscoveryTimer.isValid() || m_clientDiscoveryTimer.hasExpired(clientDiscoveryIntervalMilliseconds);
++    const auto engineTimes = readClientEngineTimes(discoverClients);
++    if (discoverClients) {
++        m_clientDiscoveryTimer.start();
++    }
++    const qint64 elapsedNanoseconds = m_usageTimer.nsecsElapsed();
++    m_usageTimer.restart();
++    m_usageProperty->setValue(m_usageSampler.sample(engineTimes, elapsedNanoseconds));
++}
++
++void LinuxMsmGpu::discoverDeviceNumbers(udev_device *device)
++{
++    addDeviceNumber(device, m_deviceNumbers);
++
++    const char *devicePath = udev_device_get_syspath(device);
++    udev *udevContext = udev_device_get_udev(device);
++    if (!devicePath || !udevContext) {
++        return;
++    }
++
++    const QString drmDevicePath = canonicalDevicePath(QString::fromLocal8Bit(devicePath));
++    if (drmDevicePath.isEmpty()) {
++        return;
++    }
++
++    static const QRegularExpression drmNodePattern(QStringLiteral("^(?:card[0-9]+|renderD[0-9]+)$"));
++    udev_enumerate *enumerate = udev_enumerate_new(udevContext);
++    if (!enumerate) {
++        return;
++    }
++    udev_enumerate_add_match_property(enumerate, "DEVTYPE", "drm_minor");
++    udev_enumerate_add_match_subsystem(enumerate, "drm");
++    udev_enumerate_scan_devices(enumerate);
++
++    for (auto entry = udev_enumerate_get_list_entry(enumerate); entry; entry = udev_list_entry_get_next(entry)) {
++        const char *path = udev_list_entry_get_name(entry);
++        udev_device *candidate = udev_device_new_from_syspath(udevContext, path);
++        if (!candidate) {
++            continue;
++        }
++
++        const char *systemName = udev_device_get_sysname(candidate);
++        const char *candidatePath = udev_device_get_syspath(candidate);
++        if (systemName && candidatePath && drmNodePattern.match(QString::fromLocal8Bit(systemName)).hasMatch()
++            && canonicalDevicePath(QString::fromLocal8Bit(candidatePath)) == drmDevicePath) {
++            addDeviceNumber(candidate, m_deviceNumbers);
++        }
++        udev_device_unref(candidate);
++    }
++    udev_enumerate_unref(enumerate);
++}
++
++QString LinuxMsmGpu::findDevfreqPath(udev_device *device) const
++{
++    const char *devicePath = udev_device_get_syspath(device);
++    if (!devicePath) {
++        return {};
++    }
++
++    const QString drmDevicePath = canonicalDevicePath(QString::fromLocal8Bit(devicePath));
++    const QString drmModulePath = QFileInfo(drmDevicePath + QStringLiteral("/driver/module")).canonicalFilePath();
++    QStringList candidates;
++    QStringList moduleCandidates;
++
++    const QDir devfreqClass(QStringLiteral("/sys/class/devfreq"));
++    const auto entries = devfreqClass.entryList(QDir::AllEntries | QDir::System | QDir::NoDotAndDotDot);
++    for (const QString &entry : entries) {
++        const QString path = devfreqClass.filePath(entry);
++        if (!isAdrenoDevfreq(path)) {
++            continue;
++        }
++
++        const QString candidateDevicePath = QFileInfo(path + QStringLiteral("/device")).canonicalFilePath();
++        if (!drmDevicePath.isEmpty() && candidateDevicePath == drmDevicePath) {
++            return path;
++        }
++
++        candidates.append(path);
++        const QString candidateModulePath = QFileInfo(path + QStringLiteral("/device/driver/module")).canonicalFilePath();
++        if (!drmModulePath.isEmpty() && candidateModulePath == drmModulePath) {
++            moduleCandidates.append(path);
++        }
++    }
++
++    if (moduleCandidates.size() == 1) {
++        return moduleCandidates.constFirst();
++    }
++    if (candidates.size() == 1) {
++        return candidates.constFirst();
++    }
++    return {};
++}
++
++std::optional<LinuxMsmClientSample> LinuxMsmGpu::readClientEngineTime(const QString &processRoot, const QString &descriptor, bool &valid) const
++{
++    valid = false;
++
++    const QString descriptorPath = processRoot + QStringLiteral("/fd/") + descriptor;
++    struct stat descriptorStat;
++    if (stat(QFile::encodeName(descriptorPath).constData(), &descriptorStat) != 0 || !S_ISCHR(descriptorStat.st_mode)
++        || !m_deviceNumbers.contains(static_cast<quint64>(descriptorStat.st_rdev))) {
++        return std::nullopt;
++    }
++
++    QFile fdInfo(processRoot + QStringLiteral("/fdinfo/") + descriptor);
++    if (!fdInfo.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        return std::nullopt;
++    }
++
++    struct stat verifiedDescriptorStat;
++    if (stat(QFile::encodeName(descriptorPath).constData(), &verifiedDescriptorStat) != 0 || descriptorStat.st_rdev != verifiedDescriptorStat.st_rdev
++        || !S_ISCHR(verifiedDescriptorStat.st_mode) || !m_deviceNumbers.contains(static_cast<quint64>(verifiedDescriptorStat.st_rdev))) {
++        return std::nullopt;
++    }
++
++    valid = true;
++    return linuxMsmClientSample(parseLinuxDrmFdInfo(&fdInfo));
++}
++
++QHash<quint64, quint64> LinuxMsmGpu::readClientEngineTimes(bool discover)
++{
++    QHash<quint64, quint64> engineTimes;
++    const QDir proc(QStringLiteral("/proc"));
++
++    // fdinfo visibility is permission-limited. In an unprivileged user
++    // session this therefore represents the visible (normally same-UID)
++    // clients, rather than a privileged system-wide accounting source.
++    if (discover) {
++        QHash<QString, QSet<QString>> discoveredDescriptors;
++        const auto processDirectories = proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::NoSort);
++        for (const QString &processName : processDirectories) {
++            bool isPid = false;
++            processName.toUInt(&isPid);
++            if (!isPid) {
++                continue;
++            }
++
++            const QString processRoot = proc.filePath(processName);
++            const QDir fdInfoDirectory(processRoot + QStringLiteral("/fdinfo"));
++            const auto descriptors = fdInfoDirectory.entryList(QDir::Files | QDir::System | QDir::NoDotAndDotDot, QDir::NoSort);
++            for (const QString &descriptor : descriptors) {
++                bool valid = false;
++                const auto sample = readClientEngineTime(processRoot, descriptor, valid);
++                if (valid) {
++                    discoveredDescriptors[processName].insert(descriptor);
++                }
++                if (sample) {
++                    mergeLinuxMsmClientSample(engineTimes, *sample);
++                }
++            }
++        }
++        m_clientDescriptors = discoveredDescriptors;
++        return engineTimes;
++    }
++
++    for (auto process = m_clientDescriptors.begin(); process != m_clientDescriptors.end();) {
++        const QString processRoot = proc.filePath(process.key());
++        auto &descriptors = process.value();
++        for (auto descriptor = descriptors.begin(); descriptor != descriptors.end();) {
++            bool valid = false;
++            const auto sample = readClientEngineTime(processRoot, *descriptor, valid);
++            if (!valid) {
++                descriptor = descriptors.erase(descriptor);
++            } else {
++                ++descriptor;
++            }
++            if (sample) {
++                mergeLinuxMsmClientSample(engineTimes, *sample);
++            }
++        }
++        if (descriptors.isEmpty()) {
++            process = m_clientDescriptors.erase(process);
++        } else {
++            ++process;
++        }
++    }
++
++    return engineTimes;
++}
++
++double LinuxMsmGpu::readFrequencyMhz(const QString &fileName, bool *ok) const
++{
++    if (ok) {
++        *ok = false;
++    }
++
++    if (m_devfreqPath.isEmpty()) {
++        return 0.0;
++    }
++
++    QFile frequencyFile(m_devfreqPath + QLatin1Char('/') + fileName);
++    if (!frequencyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
++        return 0.0;
++    }
++
++    bool parsed = false;
++    const qulonglong hertz = frequencyFile.readAll().trimmed().toULongLong(&parsed);
++    if (ok) {
++        *ok = parsed;
++    }
++    return parsed ? static_cast<double>(hertz) / hertzPerMegahertz : 0.0;
++}
++
++#include "moc_LinuxMsmGpu.cpp"
+diff --git a/plugins/gpu/LinuxMsmGpu.h b/plugins/gpu/LinuxMsmGpu.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfc0290c5485ad646fe80579cfccce72b46504f7
+--- /dev/null
++++ b/plugins/gpu/LinuxMsmGpu.h
+@@ -0,0 +1,45 @@
++/*
++    SPDX-FileCopyrightText: 2026 Leon Silcott <lnsilcott@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#pragma once
++
++#include "GpuDevice.h"
++#include "LinuxDrmFdInfo.h"
++
++#include <QElapsedTimer>
++#include <QHash>
++#include <QSet>
++
++#include <optional>
++
++struct udev_device;
++
++class LinuxMsmGpu : public GpuDevice
++{
++    Q_OBJECT
++
++public:
++    LinuxMsmGpu(const QString &id, const QString &name, udev_device *device);
++
++    void initialize() override;
++    void update() override;
++
++private:
++    void discoverDeviceNumbers(udev_device *device);
++    QString findDevfreqPath(udev_device *device) const;
++    std::optional<LinuxMsmClientSample> readClientEngineTime(const QString &processRoot, const QString &descriptor, bool &valid) const;
++    QHash<quint64, quint64> readClientEngineTimes(bool discover);
++    double readFrequencyMhz(const QString &fileName, bool *ok = nullptr) const;
++
++    QSet<quint64> m_deviceNumbers;
++    QString m_devfreqPath;
++    QHash<QString, QSet<QString>> m_clientDescriptors;
++    QElapsedTimer m_clientDiscoveryTimer;
++    LinuxDrmUsageSampler m_usageSampler;
++    QElapsedTimer m_usageTimer;
++    bool m_usageSubscribed = false;
++    bool m_frequencySubscribed = false;
++};
+diff --git a/plugins/gpu/autotests/CMakeLists.txt b/plugins/gpu/autotests/CMakeLists.txt
+index f256852014040319681bb31533fb2d0f1bb19ff1..aa9bb0cd6fd5e712917e4282f95db4a453d85461 100644
+--- a/plugins/gpu/autotests/CMakeLists.txt
++++ b/plugins/gpu/autotests/CMakeLists.txt
+@@ -5,3 +5,10 @@ ecm_add_test(nvidia.cpp ../NvidiaSmiProcess.cpp
+     TEST_NAME nvidiatest
+     LINK_LIBRARIES Qt::Test
+ )
++
++if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
++    ecm_add_test(msm.cpp ../LinuxDrmFdInfo.cpp
++        TEST_NAME msmtest
++        LINK_LIBRARIES Qt::Test
++    )
++endif()
+diff --git a/plugins/gpu/autotests/msm.cpp b/plugins/gpu/autotests/msm.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0994e551ce56f008962cafaeb9f795bc23ec9e60
+--- /dev/null
++++ b/plugins/gpu/autotests/msm.cpp
+@@ -0,0 +1,226 @@
++/*
++    SPDX-FileCopyrightText: 2026 Leon Silcott <lnsilcott@gmail.com>
++
++    SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++*/
++
++#include <QBuffer>
++#include <QTest>
++
++#include "../LinuxDrmFdInfo.h"
++
++#include <algorithm>
++#include <cstring>
++#include <utility>
++
++class ProcLikeDevice : public QIODevice
++{
++public:
++    explicit ProcLikeDevice(QByteArray data)
++        : m_data(std::move(data))
++    {
++        open(QIODevice::ReadOnly);
++    }
++
++    bool atEnd() const override
++    {
++        return true;
++    }
++
++protected:
++    qint64 readData(char *data, qint64 maximumSize) override
++    {
++        if (m_offset >= m_data.size()) {
++            return -1;
++        }
++
++        const qint64 count = std::min(maximumSize, static_cast<qint64>(m_data.size() - m_offset));
++        std::memcpy(data, m_data.constData() + m_offset, static_cast<size_t>(count));
++        m_offset += count;
++        return count;
++    }
++
++    qint64 writeData(const char *, qint64) override
++    {
++        return -1;
++    }
++
++private:
++    QByteArray m_data;
++    qint64 m_offset = 0;
++};
++
++class MsmGpuTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testFdInfoParsing();
++    void testProcLikeFdInfoParsing();
++    void testMalformedNumbers();
++    void testInvalidFdInfo_data();
++    void testInvalidFdInfo();
++    void testMsmClientSample();
++    void testDuplicateClientMerging();
++    void testUsageSampling();
++    void testClientLifecycle();
++    void testCounterRegression();
++    void testElapsedTimeAndReset();
++};
++
++void MsmGpuTest::testFdInfoParsing()
++{
++    QByteArray data = QByteArrayLiteral(
++        "pos:\t0\n"
++        "drm-driver:\tmsm\n"
++        "drm-client-id:\t42\n"
++        "drm-engine-gpu:\t123456 ns\n"
++        "drm-engine-capacity-gpu:\t2\n"
++        "drm-cycles-gpu:\t789\n");
++    QBuffer buffer(&data);
++    QVERIFY(buffer.open(QIODevice::ReadOnly));
++
++    const LinuxDrmFdInfo fdInfo = parseLinuxDrmFdInfo(&buffer);
++    QCOMPARE(fdInfo.driver, QByteArrayLiteral("msm"));
++    QVERIFY(fdInfo.clientId.has_value());
++    QCOMPARE(*fdInfo.clientId, 42);
++    QCOMPARE(fdInfo.engineTime.value(QByteArrayLiteral("gpu")), 123456);
++    QVERIFY(!fdInfo.engineTime.contains(QByteArrayLiteral("capacity-gpu")));
++
++    const auto sample = linuxMsmClientSample(fdInfo);
++    QVERIFY(sample.has_value());
++    QCOMPARE(sample->clientId, 42);
++    QCOMPARE(sample->gpuEngineTime, 123456);
++
++    QVERIFY(!linuxMsmClientSample(parseLinuxDrmFdInfo(nullptr)).has_value());
++    QBuffer unopenedBuffer;
++    QVERIFY(!linuxMsmClientSample(parseLinuxDrmFdInfo(&unopenedBuffer)).has_value());
++}
++
++void MsmGpuTest::testProcLikeFdInfoParsing()
++{
++    ProcLikeDevice device(
++        QByteArrayLiteral("drm-driver:\tmsm\n"
++                          "drm-client-id:\t7\n"
++                          "drm-engine-gpu:\t0 ns\n"));
++    QVERIFY(device.atEnd());
++
++    const auto sample = linuxMsmClientSample(parseLinuxDrmFdInfo(&device));
++    QVERIFY(sample.has_value());
++    QCOMPARE(sample->clientId, 7);
++    QCOMPARE(sample->gpuEngineTime, 0);
++}
++
++void MsmGpuTest::testMalformedNumbers()
++{
++    QByteArray data = QByteArrayLiteral(
++        "drm-driver: msm\n"
++        "drm-client-id: -1\n"
++        "drm-engine-gpu: -1 ns\n"
++        "drm-engine-copy: 12 us\n"
++        "drm-engine-video: invalid ns\n"
++        "drm-engine-: 12 ns\n");
++    QBuffer buffer(&data);
++    QVERIFY(buffer.open(QIODevice::ReadOnly));
++
++    const LinuxDrmFdInfo fdInfo = parseLinuxDrmFdInfo(&buffer);
++    QVERIFY(!fdInfo.clientId.has_value());
++    QVERIFY(fdInfo.engineTime.isEmpty());
++}
++
++void MsmGpuTest::testInvalidFdInfo_data()
++{
++    QTest::addColumn<QByteArray>("data");
++
++    QTest::newRow("wrong-driver") << QByteArrayLiteral("drm-driver: amdgpu\ndrm-client-id: 1\ndrm-engine-gpu: 20 ns\n");
++    QTest::newRow("missing-client") << QByteArrayLiteral("drm-driver: msm\ndrm-engine-gpu: 20 ns\n");
++    QTest::newRow("missing-engine") << QByteArrayLiteral("drm-driver: msm\ndrm-client-id: 1\n");
++    QTest::newRow("invalid-client") << QByteArrayLiteral("drm-driver: msm\ndrm-client-id: invalid\ndrm-engine-gpu: 20 ns\n");
++    QTest::newRow("signed-client") << QByteArrayLiteral("drm-driver: msm\ndrm-client-id: +1\ndrm-engine-gpu: 20 ns\n");
++    QTest::newRow("overflowing-client") << QByteArrayLiteral("drm-driver: msm\ndrm-client-id: 18446744073709551616\ndrm-engine-gpu: 20 ns\n");
++    QTest::newRow("invalid-unit") << QByteArrayLiteral("drm-driver: msm\ndrm-client-id: 1\ndrm-engine-gpu: 20 us\n");
++}
++
++void MsmGpuTest::testInvalidFdInfo()
++{
++    QFETCH(QByteArray, data);
++
++    QBuffer buffer(&data);
++    QVERIFY(buffer.open(QIODevice::ReadOnly));
++    QVERIFY(!linuxMsmClientSample(parseLinuxDrmFdInfo(&buffer)).has_value());
++}
++
++void MsmGpuTest::testMsmClientSample()
++{
++    LinuxDrmFdInfo fdInfo;
++    fdInfo.driver = QByteArrayLiteral("msm");
++    fdInfo.clientId = 0;
++    fdInfo.engineTime.insert(QByteArrayLiteral("gpu"), 0);
++
++    const auto sample = linuxMsmClientSample(fdInfo);
++    QVERIFY(sample.has_value());
++    QCOMPARE(sample->clientId, 0);
++    QCOMPARE(sample->gpuEngineTime, 0);
++
++    fdInfo.driver = QByteArrayLiteral("MSM");
++    QVERIFY(!linuxMsmClientSample(fdInfo).has_value());
++}
++
++void MsmGpuTest::testDuplicateClientMerging()
++{
++    QHash<quint64, quint64> clients;
++    mergeLinuxMsmClientSample(clients, {.clientId = 7, .gpuEngineTime = 100});
++    mergeLinuxMsmClientSample(clients, {.clientId = 7, .gpuEngineTime = 80});
++    mergeLinuxMsmClientSample(clients, {.clientId = 7, .gpuEngineTime = 120});
++    mergeLinuxMsmClientSample(clients, {.clientId = 8, .gpuEngineTime = 0});
++
++    QCOMPARE(clients.size(), 2);
++    QCOMPARE(clients.value(7), 120);
++    QCOMPARE(clients.value(8), 0);
++}
++
++void MsmGpuTest::testUsageSampling()
++{
++    LinuxDrmUsageSampler sampler;
++
++    QCOMPARE(sampler.sample({{1, 100}}, 500), 0.0);
++    QCOMPARE(sampler.sample({{1, 350}}, 500), 50.0);
++    QCOMPARE(sampler.sample({{1, 1350}}, 500), 100.0);
++}
++
++void MsmGpuTest::testClientLifecycle()
++{
++    LinuxDrmUsageSampler sampler;
++
++    QCOMPARE(sampler.sample({{1, 100}}, 100), 0.0);
++    QCOMPARE(sampler.sample({{1, 150}, {2, 500}}, 100), 50.0);
++    QCOMPARE(sampler.sample({{2, 550}}, 100), 50.0);
++    QCOMPARE(sampler.sample({{1, 1000}, {2, 600}}, 100), 50.0);
++    QCOMPARE(sampler.sample({{1, 1025}, {2, 625}}, 100), 50.0);
++}
++
++void MsmGpuTest::testCounterRegression()
++{
++    LinuxDrmUsageSampler sampler;
++
++    QCOMPARE(sampler.sample({{1, 100}}, 10), 0.0);
++    QCOMPARE(sampler.sample({{1, 80}}, 10), 0.0);
++    QCOMPARE(sampler.sample({{1, 90}}, 10), 0.0);
++    QCOMPARE(sampler.sample({{1, 110}}, 10), 100.0);
++}
++
++void MsmGpuTest::testElapsedTimeAndReset()
++{
++    LinuxDrmUsageSampler sampler;
++
++    QCOMPARE(sampler.sample({{1, 100}}, 100), 0.0);
++    QCOMPARE(sampler.sample({{1, 150}}, 0), 0.0);
++    QCOMPARE(sampler.sample({{1, 150}}, 100), 50.0);
++
++    sampler.reset();
++    QCOMPARE(sampler.sample({{1, 1000}}, 100), 0.0);
++}
++
++QTEST_GUILESS_MAIN(MsmGpuTest)
++
++#include "msm.moc"

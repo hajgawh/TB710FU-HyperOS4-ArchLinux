@@ -1,0 +1,13 @@
+#!/bin/bash
+# TB710FU: enable the DP/HDMI audio route (MultiMedia2 hw:0,1 -> DISPLAY_PORT_RX_0).
+# Idempotent; does not open any PCM.
+for i in $(seq 1 30); do
+  amixer -c0 controls 2>/dev/null | grep -q "DISPLAY_PORT_RX_0 Audio Mixer MultiMedia2" && break
+  sleep 1
+done
+if amixer -c0 cset name='DISPLAY_PORT_RX_0 Audio Mixer MultiMedia2' on >/dev/null 2>&1; then
+  echo "tb-dp-audio: DP mixer on"
+else
+  echo "tb-dp-audio: DP mixer control not found" >&2
+  exit 1
+fi

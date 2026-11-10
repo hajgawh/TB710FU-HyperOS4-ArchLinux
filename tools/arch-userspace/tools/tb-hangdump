@@ -1,0 +1,31 @@
+#!/bin/sh
+# TB710FU: dump kernel stacks while the DP resume commit is wedged.
+# Waits for the resume marker in the kmsg tap log, then fires sysrq-w / sysrq-t
+# well before the ~128 s PMIC watchdog resets the machine.
+TAP=/var/log/tb-kmsg-tap.log
+MARK="Restarting tasks: Done"
+DELAY=20
+
+echo 1 > /proc/sys/kernel/sysrq
+
+i=0
+while [ "$i" -lt 600 ]; do
+	if grep -q "$MARK" "$TAP" 2>/dev/null; then
+		sleep "$DELAY"
+		echo "TBHANG: sysrq-w at $(cut -d. -f1 /proc/uptime)s" > /dev/kmsg
+		echo w > /proc/sysrq-trigger
+		sleep 3
+		sync
+		echo "TBHANG: sysrq-t at $(cut -d. -f1 /proc/uptime)s" > /dev/kmsg
+		echo t > /proc/sysrq-trigger
+		sleep 3
+		sync
+		echo "TBHANG: done" > /dev/kmsg
+		exit 0
+	fi
+	sleep 0.5
+	i=$((i + 1))
+done
+
+echo "TBHANG: marker never seen" > /dev/kmsg
+exit 1

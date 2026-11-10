@@ -1,0 +1,2333 @@
+From 99ce7498cb05e3787fb667bc73a7f8bc5591630d Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Tue, 27 Oct 2026 04:10:09 +0000
+Subject: [PATCH 03/27] tb710fu 7.3: compile fixes (sy7758 optional, panel
+ orientation, aw882xx _d, dwc3, revert fan/kaanapali/sm8750, drop QDSS)
+
+---
+ arch/arm64/boot/dts/qcom/kaanapali.dtsi       | 658 +------------
+ arch/arm64/boot/dts/qcom/sm8750.dtsi          | 866 +-----------------
+ .../panel/panel-nt36532-wqhd-dual-dsi-dsc.c   |   2 +-
+ drivers/hwmon/pwm-fan.c                       |  99 +-
+ drivers/net/wireless/ath/ath12k/qmi.c         |   7 -
+ drivers/usb/dwc3/host.c                       |   4 +-
+ drivers/video/backlight/sy7758.c              |   2 +-
+ sound/soc/codecs/aw882xx/aw882xx.c            |   2 +-
+ 8 files changed, 50 insertions(+), 1590 deletions(-)
+
+diff --git a/arch/arm64/boot/dts/qcom/kaanapali.dtsi b/arch/arm64/boot/dts/qcom/kaanapali.dtsi
+index 4fb2872c2..131fd2a16 100644
+--- a/arch/arm64/boot/dts/qcom/kaanapali.dtsi
++++ b/arch/arm64/boot/dts/qcom/kaanapali.dtsi
+@@ -26,7 +26,6 @@
+ #include <dt-bindings/soc/qcom,gpr.h>
+ #include <dt-bindings/soc/qcom,rpmh-rsc.h>
+ #include <dt-bindings/sound/qcom,q6dsp-lpass-ports.h>
+-#include <dt-bindings/thermal/thermal.h>
+ 
+ #include "kaanapali-ipcc.h"
+ 
+@@ -309,13 +308,13 @@
+ 
+ 		cpu_pd6: power-domain-cpu6 {
+ 			#power-domain-cells = <0>;
+-			power-domains = <&cluster1_pd>;
++			power-domains = <&cluster_pd>;
+ 			domain-idle-states = <&cluster1_c4>;
+ 		};
+ 
+ 		cpu_pd7: power-domain-cpu7 {
+ 			#power-domain-cells = <0>;
+-			power-domains = <&cluster1_pd>;
++			power-domains = <&cluster_pd>;
+ 			domain-idle-states = <&cluster1_c4>;
+ 		};
+ 
+@@ -325,13 +324,6 @@
+ 			power-domains = <&system_pd>;
+ 		};
+ 
+-		/* CPU6-7 are a cluster of their own, as in the vendor tree */
+-		cluster1_pd: power-domain-cluster1 {
+-			#power-domain-cells = <0>;
+-			domain-idle-states = <&cluster_cl5>;
+-			power-domains = <&system_pd>;
+-		};
+-
+ 		system_pd: power-domain-system {
+ 			#power-domain-cells = <0>;
+ 			domain-idle-states = <&domain_ss3>;
+@@ -539,32 +531,6 @@
+ 		};
+ 	};
+ 
+-	smp2p-soccp {
+-		compatible = "qcom,smp2p";
+-
+-		interrupts-extended = <&ipcc IPCC_MPROC_SOCCP
+-					     IPCC_MPROC_SIGNAL_SMP2P
+-					     IRQ_TYPE_EDGE_RISING>;
+-
+-		mboxes = <&ipcc IPCC_MPROC_SOCCP
+-				IPCC_MPROC_SIGNAL_SMP2P>;
+-
+-		qcom,smem = <617>, <616>;
+-		qcom,local-pid = <0>;
+-		qcom,remote-pid = <19>;
+-
+-		soccp_smp2p_out: master-kernel {
+-			qcom,entry-name = "master-kernel";
+-			#qcom,smem-state-cells = <1>;
+-		};
+-
+-		soccp_smp2p_in: slave-kernel {
+-			qcom,entry-name = "slave-kernel";
+-			interrupt-controller;
+-			#interrupt-cells = <2>;
+-		};
+-	};
+-
+ 	soc: soc@0 {
+ 		compatible = "simple-bus";
+ 
+@@ -1618,50 +1584,6 @@
+ 			};
+ 		};
+ 
+-		remoteproc_soccp: remoteproc@d00000 {
+-			compatible = "qcom,kaanapali-soccp-pas";
+-			reg = <0x0 0x00d00000 0x0 0x200000>;
+-
+-			interrupts-extended = <&intc GIC_SPI 167 IRQ_TYPE_EDGE_RISING>,
+-					      <&soccp_smp2p_in 0 IRQ_TYPE_EDGE_RISING>,
+-					      <&soccp_smp2p_in 1 IRQ_TYPE_EDGE_RISING>,
+-					      <&soccp_smp2p_in 2 IRQ_TYPE_EDGE_RISING>,
+-					      <&soccp_smp2p_in 3 IRQ_TYPE_EDGE_RISING>,
+-					      <&soccp_smp2p_in 9 IRQ_TYPE_EDGE_RISING>;
+-			interrupt-names = "wdog",
+-					  "fatal",
+-					  "ready",
+-					  "handover",
+-					  "stop-ack",
+-					  "pong";
+-
+-			clocks = <&rpmhcc RPMH_CXO_CLK>;
+-			clock-names = "xo";
+-
+-			power-domains = <&rpmhpd RPMHPD_CX>,
+-					<&rpmhpd RPMHPD_MX>;
+-			power-domain-names = "cx",
+-					     "mx";
+-
+-			memory-region = <&soccp_mem>,
+-					<&soccp_dtb_mem>;
+-
+-			qcom,smem-states = <&soccp_smp2p_out 0>,
+-					   <&soccp_smp2p_out 8>;
+-			qcom,smem-state-names = "stop",
+-						"ping";
+-
+-			glink-edge {
+-				interrupts-extended = <&ipcc IPCC_MPROC_SOCCP
+-							     IPCC_MPROC_SIGNAL_GLINK_QMP
+-							     IRQ_TYPE_EDGE_RISING>;
+-				mboxes = <&ipcc IPCC_MPROC_SOCCP
+-						IPCC_MPROC_SIGNAL_GLINK_QMP>;
+-				qcom,remote-pid = <19>;
+-				label = "soccp";
+-			};
+-		};
+-
+ 		rng: rng@10c3000 {
+ 			compatible = "qcom,kaanapali-trng", "qcom,trng";
+ 			reg = <0x0 0x010c3000 0x0 0x1000>;
+@@ -2756,246 +2678,6 @@
+ 			#power-domain-cells = <1>;
+ 		};
+ 
+-		gpu: gpu@3d00000 {
+-			compatible = "qcom,adreno-44050a01", "qcom,adreno";
+-			reg = <0x0 0x03d00000 0x0 0x6c000>,
+-			      <0x0 0x03d9e000 0x0 0x2000>;
+-			reg-names = "kgsl_3d0_reg_memory",
+-				    "cx_mem";
+-
+-			interrupts = <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH>;
+-
+-			iommus = <&adreno_smmu 0 0x0>,
+-				 <&adreno_smmu 1 0x0>;
+-
+-			operating-points-v2 = <&gpu_opp_table>;
+-
+-			qcom,gmu = <&gmu>;
+-			#cooling-cells = <2>;
+-
+-			nvmem-cells = <&gpu_speed_bin>;
+-			nvmem-cell-names = "speed_bin";
+-
+-			interconnects = <&gem_noc MASTER_GFX3D QCOM_ICC_TAG_ALWAYS
+-					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+-			interconnect-names = "gfx-mem";
+-
+-			gpu_zap_shader: zap-shader {
+-				memory-region = <&gpu_microcode_mem>;
+-			};
+-
+-			gpu_opp_table: opp-table {
+-				compatible = "operating-points-v2-adreno",
+-					     "operating-points-v2";
+-
+-				opp-160000000 {
+-					opp-hz = /bits/ 64 <160000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D3>;
+-					opp-peak-kBps = <2136718>;
+-					opp-supported-hw = <0x0f>;
+-					/* ACD is disabled */
+-				};
+-
+-				opp-191000000 {
+-					opp-hz = /bits/ 64 <191000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D2_1>;
+-					opp-peak-kBps = <2136718>;
+-					opp-supported-hw = <0x0f>;
+-					/* ACD is disabled */
+-				};
+-
+-				opp-222000000 {
+-					opp-hz = /bits/ 64 <222000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D2>;
+-					opp-peak-kBps = <2136718>;
+-					opp-supported-hw = <0x0f>;
+-					/* ACD is disabled */
+-				};
+-
+-				opp-282000000 {
+-					opp-hz = /bits/ 64 <282000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1_1>;
+-					opp-peak-kBps = <5285156>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xca2e5ffd>;
+-				};
+-
+-				opp-342000000 {
+-					opp-hz = /bits/ 64 <342000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
+-					opp-peak-kBps = <5285156>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xe22a5ffd>;
+-				};
+-
+-				opp-382000000 {
+-					opp-hz = /bits/ 64 <382000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D0>;
+-					opp-peak-kBps = <5285156>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xa22c5ffd>;
+-				};
+-
+-				opp-422000000 {
+-					opp-hz = /bits/ 64 <422000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+-					opp-peak-kBps = <6074218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xa22c5ffd>;
+-				};
+-
+-				opp-461000000 {
+-					opp-hz = /bits/ 64 <461000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L0>;
+-					opp-peak-kBps = <6074218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xe82e5ffd>;
+-				};
+-
+-				opp-500000000 {
+-					opp-hz = /bits/ 64 <500000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
+-					opp-peak-kBps = <6074218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xe82c5ffd>;
+-				};
+-
+-				opp-578000000 {
+-					opp-hz = /bits/ 64 <578000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
+-					opp-peak-kBps = <6074218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xc02c5ffd>;
+-				};
+-
+-				opp-646000000 {
+-					opp-hz = /bits/ 64 <646000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L0>;
+-					opp-peak-kBps = <8171875>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xc02c5ffd>;
+-				};
+-
+-				opp-726000000 {
+-					opp-hz = /bits/ 64 <726000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+-					opp-peak-kBps = <8171875>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0x882f5ffd>;
+-				};
+-
+-				opp-826000000 {
+-					opp-hz = /bits/ 64 <826000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
+-					opp-peak-kBps = <12449218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xa82c5ffd>;
+-				};
+-
+-				opp-902000000 {
+-					opp-hz = /bits/ 64 <902000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
+-					opp-peak-kBps = <12449218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0xa82b5ffd>;
+-				};
+-
+-				opp-1000000000 {
+-					opp-hz = /bits/ 64 <1000000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO>;
+-					opp-peak-kBps = <12449218>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0x882a5ffd>;
+-				};
+-
+-				opp-1050000000 {
+-					opp-hz = /bits/ 64 <1050000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
+-					opp-peak-kBps = <20832031>;
+-					opp-supported-hw = <0x0f>;
+-					qcom,opp-acd-level = <0x88295ffd>;
+-				};
+-
+-				opp-1200000000 {
+-					opp-hz = /bits/ 64 <1200000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L3>;
+-					opp-peak-kBps = <20832031>;
+-					opp-supported-hw = <0x07>;
+-					qcom,opp-acd-level = <0xa02e5ffd>;
+-				};
+-
+-				opp-1300000000 {
+-					opp-hz = /bits/ 64 <1300000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L4>;
+-					opp-peak-kBps = <20832031>;
+-					opp-supported-hw = <0x03>;
+-					qcom,opp-acd-level = <0x802d5ffd>;
+-				};
+-			};
+-		};
+-
+-		gmu: gmu@3d6c000 {
+-			compatible = "qcom,adreno-gmu-840.1", "qcom,adreno-gmu";
+-
+-			reg = <0x0 0x03d6c000 0x0 0x68000>;
+-			reg-names = "gmu";
+-
+-			interrupts = <GIC_SPI 304 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 305 IRQ_TYPE_LEVEL_HIGH>;
+-			interrupt-names = "hfi", "gmu";
+-
+-			clocks = <&gpucc GPU_CC_AHB_CLK>,
+-				 <&gpucc GPU_CC_CX_GMU_CLK>,
+-				 <&gpucc GPU_CC_CXO_CLK>,
+-				 <&gcc GCC_GPU_GEMNOC_GFX_CLK>,
+-				 <&gpucc GPU_CC_HUB_CX_INT_CLK>;
+-			clock-names = "ahb",
+-				      "gmu",
+-				      "cxo",
+-				      "memnoc",
+-				      "hub";
+-
+-			power-domains = <&gpucc GPU_CC_CX_GDSC>,
+-					<&gxclkctl GX_CLKCTL_GX_GDSC>;
+-			power-domain-names = "cx",
+-					     "gx";
+-
+-			iommus = <&adreno_smmu 5 0x0>;
+-
+-			qcom,qmp = <&aoss_qmp>;
+-
+-			operating-points-v2 = <&gmu_opp_table>;
+-
+-			gmu_opp_table: opp-table {
+-				compatible = "operating-points-v2";
+-
+-				opp-475000000 {
+-					opp-hz = /bits/ 64 <475000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
+-				};
+-
+-				opp-575000000 {
+-					opp-hz = /bits/ 64 <575000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+-				};
+-
+-				opp-700000000 {
+-					opp-hz = /bits/ 64 <700000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
+-				};
+-
+-				opp-725000000 {
+-					opp-hz = /bits/ 64 <725000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+-				};
+-
+-				opp-750000000 {
+-					opp-hz = /bits/ 64 <750000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
+-				};
+-			};
+-		};
+-
+ 		gxclkctl: clock-controller@3d64000 {
+ 			compatible = "qcom,kaanapali-gxclkctl";
+ 			reg = <0x0 0x03d64000 0x0 0x6000>;
+@@ -3020,46 +2702,6 @@
+ 			#power-domain-cells = <1>;
+ 		};
+ 
+-		adreno_smmu: iommu@3da0000 {
+-			compatible = "qcom,kaanapali-smmu-500",
+-				     "qcom,adreno-smmu",
+-				     "qcom,smmu-500",
+-				     "arm,mmu-500";
+-			reg = <0x0 0x03da0000 0x0 0x40000>;
+-			#iommu-cells = <2>;
+-			#global-interrupts = <1>;
+-			interrupts = <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 678 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 679 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 680 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 681 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 682 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 683 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 684 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 685 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 686 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 687 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 688 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 422 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 476 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 574 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 575 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 576 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 577 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 660 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 662 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 665 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 666 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 667 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 669 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 670 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 700 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&gpucc GPU_CC_GPU_SMMU_VOTE_CLK>;
+-			clock-names = "hlos";
+-			power-domains = <&gpucc GPU_CC_CX_GDSC>;
+-			dma-coherent;
+-		};
+-
+ 		remoteproc_adsp: remoteproc@6800000 {
+ 			compatible = "qcom,kaanapali-adsp-pas", "qcom,sm8550-adsp-pas";
+ 			reg = <0x0 0x06800000 0x0 0x10000>;
+@@ -3167,7 +2809,7 @@
+ 					compatible = "qcom,gpr";
+ 					qcom,glink-channels = "adsp_apps";
+ 					qcom,domain = <GPR_DOMAIN_ID_ADSP>;
+-					qcom,intents = <512 20>, <1024 8>;
++					qcom,intents = <512 20>;
+ 					#address-cells = <1>;
+ 					#size-cells = <0>;
+ 
+@@ -3749,9 +3391,7 @@
+ 
+ 				operating-points-v2 = <&mdp_opp_table>;
+ 
+-				power-domains = <&rpmhpd RPMHPD_MMCX>,
+-						<&dispcc DISP_CC_MDSS_CORE_INT2_GDSC>;
+-				power-domain-names = "mmcx", "int2";
++				power-domains = <&rpmhpd RPMHPD_MMCX>;
+ 
+ 				ports {
+ 					#address-cells = <1>;
+@@ -3769,7 +3409,6 @@
+ 						reg = <1>;
+ 
+ 						dpu_intf2_out: endpoint {
+-							remote-endpoint = <&mdss_dsi1_in>;
+ 						};
+ 					};
+ 
+@@ -3929,91 +3568,6 @@
+ 
+ 				status = "disabled";
+ 			};
+-
+-			mdss_dsi1: dsi@9ac3000 {
+-				compatible = "qcom,kaanapali-dsi-ctrl", "qcom,mdss-dsi-ctrl";
+-				reg = <0x0 0x09ac3000 0x0 0x1000>;
+-				reg-names = "dsi_ctrl";
+-
+-				interrupts-extended = <&mdss 5>;
+-
+-				clocks = <&dispcc DISP_CC_MDSS_BYTE1_CLK>,
+-					 <&dispcc DISP_CC_MDSS_BYTE1_INTF_CLK>,
+-					 <&dispcc DISP_CC_MDSS_PCLK1_CLK>,
+-					 <&dispcc DISP_CC_MDSS_ESC1_CLK>,
+-					 <&dispcc DISP_CC_MDSS_AHB_CLK>,
+-					 <&gcc GCC_DISP_HF_AXI_CLK>,
+-					 <&mdss_dsi1_phy DSI_PIXEL_PLL_CLK>,
+-					 <&mdss_dsi1_phy DSI_BYTE_PLL_CLK>,
+-					 <&dispcc DISP_CC_ESYNC1_CLK>,
+-					 <&dispcc DISP_CC_OSC_CLK>,
+-					 <&dispcc DISP_CC_MDSS_BYTE1_CLK_SRC>,
+-					 <&dispcc DISP_CC_MDSS_PCLK1_CLK_SRC>;
+-				clock-names = "byte",
+-					      "byte_intf",
+-					      "pixel",
+-					      "core",
+-					      "iface",
+-					      "bus",
+-					      "dsi_pll_pixel",
+-					      "dsi_pll_byte",
+-					      "esync",
+-					      "osc",
+-					      "byte_src",
+-					      "pixel_src";
+-
+-				operating-points-v2 = <&mdss_dsi_opp_table>;
+-
+-				power-domains = <&rpmhpd RPMHPD_MMCX>;
+-
+-				phys = <&mdss_dsi1_phy>;
+-				phy-names = "dsi";
+-
+-				#address-cells = <1>;
+-				#size-cells = <0>;
+-
+-				status = "disabled";
+-
+-				ports {
+-					#address-cells = <1>;
+-					#size-cells = <0>;
+-
+-					port@0 {
+-						reg = <0>;
+-
+-						mdss_dsi1_in: endpoint {
+-							remote-endpoint = <&dpu_intf2_out>;
+-						};
+-					};
+-
+-					port@1 {
+-						reg = <1>;
+-
+-						mdss_dsi1_out: endpoint {
+-						};
+-					};
+-				};
+-			};
+-
+-			mdss_dsi1_phy: phy@9ac4000 {
+-				compatible = "qcom,kaanapali-dsi-phy-3nm";
+-				reg = <0x0 0x09ac4000 0x0 0x1cc>,
+-				      <0x0 0x09ac4200 0x0 0x280>,
+-				      <0x0 0x09ac4500 0x0 0x400>;
+-				reg-names = "dsi_phy",
+-					    "dsi_phy_lane",
+-					    "dsi_pll";
+-
+-				clocks = <&dispcc DISP_CC_MDSS_AHB_CLK>,
+-					 <&rpmhcc RPMH_CXO_CLK>;
+-				clock-names = "iface",
+-					      "ref";
+-
+-				#clock-cells = <1>;
+-				#phy-cells = <0>;
+-
+-				status = "disabled";
+-			};
+ 		};
+ 
+ 		dispcc: clock-controller@9ba2000 {
+@@ -6207,13 +5761,6 @@
+ 			#mbox-cells = <1>;
+ 		};
+ 
+-		cpucp_mbox: mailbox@17620000 {
+-			compatible = "qcom,kaanapali-cpucp-mbox", "qcom,x1e80100-cpucp-mbox";
+-			reg = <0x0 0x17620000 0x0 0x8000>, <0x0 0x18830000 0x0 0x8000>;
+-			interrupts = <GIC_SPI 28 IRQ_TYPE_LEVEL_HIGH>;
+-			#mbox-cells = <1>;
+-		};
+-
+ 		timer@17810000 {
+ 			compatible = "arm,armv7-timer-mem";
+ 			reg = <0x0 0x17810000 0x0 0x1000>;
+@@ -6423,38 +5970,6 @@
+ 			};
+ 		};
+ 
+-		efuse@221c8000 {
+-			compatible = "qcom,kaanapali-qfprom", "qcom,qfprom";
+-			reg = <0x0 0x221c8000 0x0 0x1000>;
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-
+-			gpu_speed_bin: gpu-speed-bin@142 {
+-				reg = <0x142 0x2>;
+-				bits = <3 9>;
+-			};
+-		};
+-
+-		cpucp_sram: sram@1d838000 {
+-			compatible = "mmio-sram";
+-			reg = <0x0 0x1d838000 0x0 0x400>;
+-
+-			#address-cells = <1>;
+-			#size-cells = <1>;
+-
+-			ranges = <0x0 0x0 0x1d838000 0x400>;
+-
+-			cpucp_scp_lpri0: scp-sram-section@0 {
+-				compatible = "arm,scmi-shmem";
+-				reg = <0x0 0x200>;
+-			};
+-
+-			cpucp_scp_lpri1: scp-sram-section@200 {
+-				compatible = "arm,scmi-shmem";
+-				reg = <0x200 0x200>;
+-			};
+-		};
+-
+ 		nsp_noc: interconnect@260c0000 {
+ 			compatible = "qcom,kaanapali-nsp-noc";
+ 			reg = <0x0 0x260c0000 0x0 0x21280>;
+@@ -7388,17 +6903,9 @@
+ 		};
+ 
+ 		gpuss-0-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 0>;
+ 
+ 			trips {
+-				gpuss_0_alert0: gpuss-0-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-0-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7411,27 +6918,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_0_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-1-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 1>;
+ 
+ 			trips {
+-				gpuss_1_alert0: gpuss-1-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-1-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7444,27 +6936,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_1_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-2-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 2>;
+ 
+ 			trips {
+-				gpuss_2_alert0: gpuss-2-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-2-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7477,27 +6954,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_2_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-3-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 3>;
+ 
+ 			trips {
+-				gpuss_3_alert0: gpuss-3-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-3-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7510,27 +6972,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_3_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-4-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 4>;
+ 
+ 			trips {
+-				gpuss_4_alert0: gpuss-4-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-4-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7543,27 +6990,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_4_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-5-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 5>;
+ 
+ 			trips {
+-				gpuss_5_alert0: gpuss-5-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-5-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7576,27 +7008,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_5_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-6-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 6>;
+ 
+ 			trips {
+-				gpuss_6_alert0: gpuss-6-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-6-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7609,27 +7026,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_6_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-7-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 7>;
+ 
+ 			trips {
+-				gpuss_7_alert0: gpuss-7-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-7-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7642,27 +7044,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_7_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-8-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 8>;
+ 
+ 			trips {
+-				gpuss_8_alert0: gpuss-8-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-8-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7675,27 +7062,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_8_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-9-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 9>;
+ 
+ 			trips {
+-				gpuss_9_alert0: gpuss-9-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-9-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7708,27 +7080,12 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_9_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		gpuss-10-thermal {
+-			polling-delay-passive = <10>;
+-
+ 			thermal-sensors = <&tsens5 10>;
+ 
+ 			trips {
+-				gpuss_10_alert0: gpuss-10-alert0 {
+-					temperature = <105000>;
+-					hysteresis = <5000>;
+-					type = "passive";
+-				};
+-
+ 				gpuss-10-hot {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+@@ -7741,13 +7098,6 @@
+ 					type = "critical";
+ 				};
+ 			};
+-
+-			cooling-maps {
+-				map0 {
+-					trip = <&gpuss_10_alert0>;
+-					cooling-device = <&gpu THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+ 		};
+ 
+ 		ddr-thermal {
+diff --git a/arch/arm64/boot/dts/qcom/sm8750.dtsi b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+index 627ae578f..dd738d13d 100644
+--- a/arch/arm64/boot/dts/qcom/sm8750.dtsi
++++ b/arch/arm64/boot/dts/qcom/sm8750.dtsi
+@@ -8,9 +8,7 @@
+ #include <dt-bindings/clock/qcom,sm8750-cambistmclkcc.h>
+ #include <dt-bindings/clock/qcom,sm8750-camcc.h>
+ #include <dt-bindings/clock/qcom,sm8750-dispcc.h>
+-#include <dt-bindings/clock/qcom,kaanapali-gxclkctl.h>
+ #include <dt-bindings/clock/qcom,sm8750-gcc.h>
+-#include <dt-bindings/clock/qcom,sm8750-gpucc.h>
+ #include <dt-bindings/clock/qcom,sm8750-tcsr.h>
+ #include <dt-bindings/clock/qcom,sm8750-videocc.h>
+ #include <dt-bindings/dma/qcom-gpi.h>
+@@ -43,7 +41,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x0>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd0>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -61,7 +58,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x100>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd1>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -73,7 +69,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x200>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd2>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -85,7 +80,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x300>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd3>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -97,7 +91,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x400>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd4>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -109,7 +102,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x500>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1792>;
+ 			next-level-cache = <&l2_0>;
+ 			power-domains = <&cpu_pd5>, <&scmi_dvfs 0>;
+ 			power-domain-names = "psci", "perf";
+@@ -121,7 +113,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x10000>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1894>;
+ 			next-level-cache = <&l2_1>;
+ 			power-domains = <&cpu_pd6>, <&scmi_dvfs 1>;
+ 			power-domain-names = "psci", "perf";
+@@ -139,7 +130,6 @@
+ 			compatible = "qcom,oryon";
+ 			reg = <0x0 0x10100>;
+ 			enable-method = "psci";
+-			capacity-dmips-mhz = <1894>;
+ 			next-level-cache = <&l2_1>;
+ 			power-domains = <&cpu_pd7>, <&scmi_dvfs 1>;
+ 			power-domain-names = "psci", "perf";
+@@ -1250,28 +1240,6 @@
+ 
+ 				status = "disabled";
+ 			};
+-
+-			uart15: serial@89c000 {
+-				compatible = "qcom,geni-uart";
+-				reg = <0x0 0x0089c000 0x0 0x4000>;
+-
+-				interrupts = <GIC_SPI 462 IRQ_TYPE_LEVEL_HIGH>;
+-
+-				clocks = <&gcc GCC_QUPV3_WRAP2_S7_CLK>;
+-				clock-names = "se";
+-
+-				interconnects = <&clk_virt MASTER_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS
+-						 &clk_virt SLAVE_QUP_CORE_2 QCOM_ICC_TAG_ALWAYS>,
+-						<&gem_noc MASTER_APPSS_PROC QCOM_ICC_TAG_ALWAYS
+-						 &config_noc SLAVE_QUP_2 QCOM_ICC_TAG_ALWAYS>;
+-				interconnect-names = "qup-core",
+-						     "qup-config";
+-
+-				pinctrl-0 = <&qup_uart15_default>;
+-				pinctrl-names = "default";
+-
+-				status = "disabled";
+-			};
+ 		};
+ 
+ 		i2c_master_hub_0: geniqup@9c0000 {
+@@ -3544,216 +3512,6 @@
+ 			#power-domain-cells = <1>;
+ 		};
+ 
+-		gpu: gpu@3d00000 {
+-			compatible = "qcom,adreno-44050000", "qcom,adreno";
+-			reg = <0x0 0x03d00000 0x0 0x6c000>,
+-			      <0x0 0x03d9e000 0x0 0x2000>,
+-			      <0x0 0x03d61000 0x0 0x800>;
+-			reg-names = "kgsl_3d0_reg_memory",
+-				    "cx_mem",
+-				    "cx_dbgc";
+-
+-			interrupts = <GIC_SPI 300 IRQ_TYPE_LEVEL_HIGH>;
+-
+-			iommus = <&adreno_smmu 0 0x0>,
+-				 <&adreno_smmu 1 0x0>;
+-
+-			operating-points-v2 = <&gpu_opp_table>;
+-
+-			qcom,gmu = <&gmu>;
+-			#cooling-cells = <2>;
+-
+-			interconnects = <&gem_noc MASTER_GFX3D QCOM_ICC_TAG_ALWAYS
+-					 &mc_virt SLAVE_EBI1 QCOM_ICC_TAG_ALWAYS>;
+-			interconnect-names = "gfx-mem";
+-
+-			status = "disabled";
+-
+-			gpu_zap_shader: zap-shader {
+-				memory-region = <&gpu_micro_code_mem>;
+-			};
+-
+-			gpu_opp_table: opp-table {
+-				compatible = "operating-points-v2-adreno",
+-						"operating-points-v2";
+-
+-				opp-1100000000 {
+-					opp-hz = /bits/ 64 <1100000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L3>;
+-					opp-peak-kBps = <20832031>;
+-					qcom,opp-acd-level = <0x882a5ffd>;
+-				};
+-
+-				opp-1050000000 {
+-					opp-hz = /bits/ 64 <1050000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_TURBO_L1>;
+-					opp-peak-kBps = <20832031>;
+-					qcom,opp-acd-level = <0x882a5ffd>;
+-				};
+-
+-				opp-967000000 {
+-					opp-hz = /bits/ 64 <967000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_NOM_L1>;
+-					opp-peak-kBps = <12449218>;
+-					qcom,opp-acd-level = <0x882b5ffd>;
+-				};
+-
+-				opp-900000000 {
+-					opp-hz = /bits/ 64 <900000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
+-					opp-peak-kBps = <12449218>;
+-					qcom,opp-acd-level = <0x882b5ffd>;
+-				};
+-
+-				opp-832000000 {
+-					opp-hz = /bits/ 64 <832000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L2>;
+-					opp-peak-kBps = <12449218>;
+-					qcom,opp-acd-level = <0x882b5ffd>;
+-				};
+-
+-				opp-734000000 {
+-					opp-hz = /bits/ 64 <734000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L1>;
+-					opp-peak-kBps = <8171875>;
+-					qcom,opp-acd-level = <0xa82b5ffd>;
+-				};
+-
+-				opp-660000000 {
+-					opp-hz = /bits/ 64 <660000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS_L0>;
+-					opp-peak-kBps = <8171875>;
+-					qcom,opp-acd-level = <0x882d5ffd>;
+-				};
+-
+-				opp-607000000 {
+-					opp-hz = /bits/ 64 <607000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
+-					opp-peak-kBps = <6074218>;
+-					qcom,opp-acd-level = <0xa82e5ffd>;
+-				};
+-
+-				opp-525000000 {
+-					opp-hz = /bits/ 64 <525000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_L1>;
+-					opp-peak-kBps = <6074218>;
+-					qcom,opp-acd-level = <0xc0285ffd>;
+-				};
+-
+-				opp-443000000 {
+-					opp-hz = /bits/ 64 <443000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+-					opp-peak-kBps = <6074218>;
+-					qcom,opp-acd-level = <0xe02d5ffd>;
+-				};
+-
+-				opp-389000000 {
+-					opp-hz = /bits/ 64 <389000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D0>;
+-					opp-peak-kBps = <5285156>;
+-					qcom,opp-acd-level = <0xe02f5ffd>;
+-				};
+-
+-				opp-342000000 {
+-					opp-hz = /bits/ 64 <342000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D1>;
+-					opp-peak-kBps = <5285156>;
+-				};
+-
+-				opp-222000000 {
+-					opp-hz = /bits/ 64 <222000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D2>;
+-					opp-peak-kBps = <2136718>;
+-				};
+-
+-				opp-160000000 {
+-					opp-hz = /bits/ 64 <160000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS_D3>;
+-					opp-peak-kBps = <2136718>;
+-				};
+-			};
+-		};
+-
+-		gmu: gmu@3d37000 {
+-			compatible = "qcom,adreno-gmu-830.1", "qcom,adreno-gmu";
+-
+-			reg = <0x0 0x03d37000 0x0 0x68000>;
+-			reg-names = "gmu";
+-
+-			interrupts = <GIC_SPI 304 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 305 IRQ_TYPE_LEVEL_HIGH>;
+-			interrupt-names = "hfi", "gmu";
+-
+-			clocks = <&gpucc GPU_CC_AHB_CLK>,
+-				 <&gpucc GPU_CC_CX_GMU_CLK>,
+-				 <&gpucc GPU_CC_CXO_CLK>,
+-				 <&gcc GCC_GPU_GEMNOC_GFX_CLK>,
+-				 <&gpucc GPU_CC_HUB_CX_INT_CLK>;
+-			clock-names = "ahb",
+-				      "gmu",
+-				      "cxo",
+-				      "memnoc",
+-				      "hub";
+-
+-			power-domains = <&gpucc GPU_CC_CX_GDSC>,
+-					<&gxclkctl GX_CLKCTL_GX_GDSC>;
+-			power-domain-names = "cx",
+-						 "gx";
+-
+-			iommus = <&adreno_smmu 5 0x0>;
+-
+-			qcom,qmp = <&aoss_qmp>;
+-
+-			operating-points-v2 = <&gmu_opp_table>;
+-
+-			gmu_opp_table: opp-table {
+-				compatible = "operating-points-v2";
+-
+-				opp-500000000 {
+-					opp-hz = /bits/ 64 <500000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_LOW_SVS>;
+-				};
+-
+-				opp-650000000 {
+-					opp-hz = /bits/ 64 <650000000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_SVS>;
+-				};
+-
+-				opp-687500000 {
+-					opp-hz = /bits/ 64 <687500000>;
+-					opp-level = <RPMH_REGULATOR_LEVEL_NOM>;
+-				};
+-			};
+-		};
+-
+-		gxclkctl: clock-controller@3d64000 {
+-			compatible = "qcom,sm8750-gxclkctl";
+-			reg = <0x0 0x03d64000 0x0 0x6000>;
+-
+-			power-domains = <&rpmhpd RPMHPD_GFX>,
+-					<&rpmhpd RPMHPD_GMXC>,
+-					<&gpucc GPU_CC_CX_GDSC>;
+-
+-			#power-domain-cells = <1>;
+-		};
+-
+-		gpucc: clock-controller@3d90000 {
+-			compatible = "qcom,sm8750-gpucc";
+-			reg = <0x0 0x03d90000 0x0 0x9800>;
+-
+-			clocks = <&bi_tcxo_div2>,
+-				 <&gcc GCC_GPU_GPLL0_CLK_SRC>,
+-				 <&gcc GCC_GPU_GPLL0_DIV_CLK_SRC>;
+-
+-			power-domains = <&rpmhpd RPMHPD_MX>,
+-					<&rpmhpd RPMHPD_CX>;
+-			required-opps = <&rpmhpd_opp_low_svs>,
+-					<&rpmhpd_opp_low_svs>;
+-			#clock-cells = <1>;
+-			#reset-cells = <1>;
+-			#power-domain-cells = <1>;
+-		};
+-
+ 		pdc: interrupt-controller@b220000 {
+ 			compatible = "qcom,sm8750-pdc", "qcom,pdc";
+ 			reg = <0x0 0x0b220000 0x0 0x10000>, <0x0 0x164400f0 0x0 0x64>;
+@@ -5525,44 +5283,6 @@
+ 			};
+ 		};
+ 
+-		adreno_smmu: iommu@3da0000 {
+-			compatible = "qcom,sm8750-smmu-500", "qcom,adreno-smmu",
+-				     "qcom,smmu-500", "arm,mmu-500";
+-			reg = <0x0 0x03da0000 0x0 0x40000>;
+-			#iommu-cells = <2>;
+-			#global-interrupts = <1>;
+-			interrupts = <GIC_SPI 674 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 678 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 679 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 680 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 681 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 682 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 683 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 684 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 685 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 686 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 687 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 688 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 422 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 476 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 574 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 575 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 576 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 577 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 660 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 662 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 665 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 666 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 667 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 669 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 670 IRQ_TYPE_LEVEL_HIGH>,
+-				     <GIC_SPI 700 IRQ_TYPE_LEVEL_HIGH>;
+-			clocks = <&gpucc GPU_CC_HLOS1_VOTE_GPU_SMMU_CLK>;
+-			clock-names = "hlos";
+-			power-domains = <&gpucc GPU_CC_CX_GDSC>;
+-			dma-coherent;
+-		};
+-
+ 		apps_smmu: iommu@15000000 {
+ 			compatible = "qcom,sm8750-smmu-500", "qcom,smmu-500", "arm,mmu-500";
+ 			reg = <0x0 0x15000000 0x0 0x100000>;
+@@ -5846,16 +5566,6 @@
+ 					opp-peak-kBps = <1969000 1>;
+ 				};
+ 
+-				/*
+-				 * Suspend-only: the synthetic opp-hz and missing opp-level
+-				 * keep link-speed matching from selecting it.
+-				 */
+-				opp-suspend-1 {
+-					opp-hz = /bits/ 64 <1>;
+-					required-opps = <&rpmhpd_opp_low_svs>;
+-					opp-peak-kBps = <1000 1>;
+-					opp-suspend;
+-				};
+ 			};
+ 
+ 			pcieport0: pcie@0 {
+@@ -6538,46 +6248,10 @@
+ 		};
+ 
+ 		cpu-0-0-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 1>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_0_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_0_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_0_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_0_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6592,46 +6266,10 @@
+ 		};
+ 
+ 		cpu-0-0-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 2>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_0_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_0_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_0_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_0_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6646,46 +6284,10 @@
+ 		};
+ 
+ 		cpu-0-1-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 3>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_1_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_1_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_1_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_1_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6700,46 +6302,10 @@
+ 		};
+ 
+ 		cpu-0-1-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 4>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_1_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_1_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_1_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_1_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6754,46 +6320,10 @@
+ 		};
+ 
+ 		cpu-0-2-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 5>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_2_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_2_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_2_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_2_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6808,46 +6338,10 @@
+ 		};
+ 
+ 		cpu-0-2-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 6>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_2_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_2_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_2_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_2_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6862,46 +6356,10 @@
+ 		};
+ 
+ 		cpu-0-3-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 7>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_3_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_3_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_3_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_3_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6916,46 +6374,10 @@
+ 		};
+ 
+ 		cpu-0-3-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 8>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_3_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_3_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_3_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_3_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -6970,46 +6392,10 @@
+ 		};
+ 
+ 		cpu-0-4-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 9>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_4_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_4_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_4_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_4_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7024,46 +6410,10 @@
+ 		};
+ 
+ 		cpu-0-4-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 10>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_4_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_4_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_4_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_4_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7078,46 +6428,10 @@
+ 		};
+ 
+ 		cpu-0-5-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 11>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_5_0_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_5_0_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_5_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_5_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7132,46 +6446,10 @@
+ 		};
+ 
+ 		cpu-0-5-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens0 12>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_0_5_1_alert0>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_0_5_1_alert1>;
+-					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_0_5_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_0_5_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7240,38 +6518,10 @@
+ 		};
+ 
+ 		cpu-1-0-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens1 1>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_1_0_0_alert0>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_1_0_0_alert1>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_1_0_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_1_0_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7286,38 +6536,10 @@
+ 		};
+ 
+ 		cpu-1-0-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens1 2>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_1_0_1_alert0>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_1_0_1_alert1>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_1_0_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_1_0_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7332,38 +6554,10 @@
+ 		};
+ 
+ 		cpu-1-1-0-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens1 3>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_1_1_0_alert0>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_1_1_0_alert1>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_1_1_0_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_1_1_0_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+@@ -7378,38 +6572,10 @@
+ 		};
+ 
+ 		cpu-1-1-1-thermal {
+-			polling-delay-passive = <250>;
+-
+ 			thermal-sensors = <&tsens1 4>;
+ 
+-			cooling-maps {
+-				map0 {
+-					trip = <&cpu_1_1_1_alert0>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-
+-				map1 {
+-					trip = <&cpu_1_1_1_alert1>;
+-					cooling-device = <&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+-							 <&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+-				};
+-			};
+-
+ 			trips {
+-				cpu_1_1_1_alert0: trip-point0 {
+-					temperature = <90000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				cpu_1_1_1_alert1: trip-point1 {
+-					temperature = <95000>;
+-					hysteresis = <2000>;
+-					type = "passive";
+-				};
+-
+-				trip-point2 {
++				trip-point0 {
+ 					temperature = <120000>;
+ 					hysteresis = <5000>;
+ 					type = "hot";
+diff --git a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+index bd79e8ca3..b41b8f6b2 100644
+--- a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
++++ b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+@@ -407,7 +407,7 @@ static int nt36532_probe(struct mipi_dsi_device *dsi)
+ 	pinfo->dsi[0] = dsi;
+ 	mipi_dsi_set_drvdata(dsi, pinfo);
+ 
+-        ret = of_drm_get_panel_orientation(dev->of_node, &pinfo->orientation);
++        ret = drm_of_get_panel_orientation(dev->of_node, &pinfo->orientation);
+ 	if (ret < 0) {
+ 		dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, ret);
+ 		return ret;
+diff --git a/drivers/hwmon/pwm-fan.c b/drivers/hwmon/pwm-fan.c
+index 4580a6bd8..c633d7f64 100644
+--- a/drivers/hwmon/pwm-fan.c
++++ b/drivers/hwmon/pwm-fan.c
+@@ -13,9 +13,7 @@
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+ #include <linux/platform_device.h>
+-#include <linux/power_supply.h>
+ #include <linux/property.h>
+-#include <linux/suspend.h>
+ #include <linux/pwm.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/sysfs.h>
+@@ -66,14 +64,6 @@ struct pwm_fan_ctx {
+ 	u64 pwm_duty_cycle_from_stopped;
+ 	u32 pwm_usec_from_stopped;
+ 	u8 pwm_shutdown;
+-
+-	/* Fan speed while a charger is connected during system sleep, 0 = off */
+-	u8 pwm_sleep_charging;
+-	bool suspended;
+-	bool charging_valid;
+-	bool charging_on;
+-	unsigned long pwm_awake;
+-	struct notifier_block psy_nb;
+ };
+ 
+ /* This handler assumes self resetting edge triggered interrupt. */
+@@ -151,19 +141,9 @@ static int pwm_fan_switch_power(struct pwm_fan_ctx *ctx, bool on)
+ 	return ret;
+ }
+ 
+-/* Commit the new state only once the hardware has taken it */
+-static int pwm_fan_apply(struct pwm_fan_ctx *ctx, struct pwm_state *state)
+-{
+-	int ret = pwm_apply_might_sleep(ctx->pwm, state);
+-
+-	if (!ret)
+-		ctx->pwm_state = *state;
+-	return ret;
+-}
+-
+ static int pwm_fan_power_on(struct pwm_fan_ctx *ctx)
+ {
+-	struct pwm_state state = ctx->pwm_state;
++	struct pwm_state *state = &ctx->pwm_state;
+ 	int ret;
+ 
+ 	if (ctx->enabled)
+@@ -175,8 +155,8 @@ static int pwm_fan_power_on(struct pwm_fan_ctx *ctx)
+ 		return ret;
+ 	}
+ 
+-	state.enabled = true;
+-	ret = pwm_fan_apply(ctx, &state);
++	state->enabled = true;
++	ret = pwm_apply_might_sleep(ctx->pwm, state);
+ 	if (ret) {
+ 		dev_err(ctx->dev, "failed to enable PWM\n");
+ 		goto disable_regulator;
+@@ -193,7 +173,7 @@ disable_regulator:
+ 
+ static int pwm_fan_power_off(struct pwm_fan_ctx *ctx, bool force_disable)
+ {
+-	struct pwm_state state = ctx->pwm_state;
++	struct pwm_state *state = &ctx->pwm_state;
+ 	bool enable_regulator = false;
+ 	int ret;
+ 
+@@ -201,13 +181,13 @@ static int pwm_fan_power_off(struct pwm_fan_ctx *ctx, bool force_disable)
+ 		return 0;
+ 
+ 	pwm_fan_enable_mode_2_state(ctx->enable_mode,
+-				    &state,
++				    state,
+ 				    &enable_regulator);
+ 
+ 	if (force_disable)
+-		state.enabled = false;
+-	state.duty_cycle = 0;
+-	ret = pwm_fan_apply(ctx, &state);
++		state->enabled = false;
++	state->duty_cycle = 0;
++	ret = pwm_apply_might_sleep(ctx->pwm, state);
+ 	if (ret) {
+ 		dev_err(ctx->dev, "failed to disable PWM\n");
+ 		return ret;
+@@ -222,7 +202,8 @@ static int pwm_fan_power_off(struct pwm_fan_ctx *ctx, bool force_disable)
+ 
+ static int  __set_pwm(struct pwm_fan_ctx *ctx, unsigned long pwm)
+ {
+-	struct pwm_state state = ctx->pwm_state;
++	struct pwm_state *state = &ctx->pwm_state;
++	unsigned long final_pwm = pwm;
+ 	unsigned long period;
+ 	bool update = false;
+ 	int ret = 0;
+@@ -232,23 +213,22 @@ static int  __set_pwm(struct pwm_fan_ctx *ctx, unsigned long pwm)
+ 			/* pwm-fan hard disabled */
+ 			return 0;
+ 
+-		period = state.period;
+-		update = ctx->pwm_duty_cycle_from_stopped &&
+-			 (!ctx->enabled || state.duty_cycle < ctx->pwm_duty_cycle_from_stopped);
++		period = state->period;
++		update = state->duty_cycle < ctx->pwm_duty_cycle_from_stopped;
+ 		if (update)
+-			state.duty_cycle = ctx->pwm_duty_cycle_from_stopped;
++			state->duty_cycle = ctx->pwm_duty_cycle_from_stopped;
+ 		else
+-			state.duty_cycle = DIV_ROUND_UP(pwm * (period - 1), MAX_PWM);
+-		ret = pwm_fan_apply(ctx, &state);
++			state->duty_cycle = DIV_ROUND_UP(pwm * (period - 1), MAX_PWM);
++		ret = pwm_apply_might_sleep(ctx->pwm, state);
+ 		if (ret)
+ 			return ret;
+ 		ret = pwm_fan_power_on(ctx);
+ 		if (!ret && update) {
+-			state = ctx->pwm_state;
+-			state.duty_cycle = DIV_ROUND_UP(pwm * (period - 1), MAX_PWM);
++			pwm = final_pwm;
++			state->duty_cycle = DIV_ROUND_UP(pwm * (period - 1), MAX_PWM);
+ 			usleep_range(ctx->pwm_usec_from_stopped,
+ 				     ctx->pwm_usec_from_stopped * 2);
+-			ret = pwm_fan_apply(ctx, &state);
++			ret = pwm_apply_might_sleep(ctx->pwm, state);
+ 		}
+ 	} else {
+ 		ret = pwm_fan_power_off(ctx, false);
+@@ -309,15 +289,15 @@ static int pwm_fan_update_enable(struct pwm_fan_ctx *ctx, long val)
+ 		 * Nothing to do if currently enabled
+ 		 */
+ 		if (!ctx->enabled) {
+-			struct pwm_state state = ctx->pwm_state;
++			struct pwm_state *state = &ctx->pwm_state;
+ 			bool enable_regulator = false;
+ 
+-			state.duty_cycle = 0;
++			state->duty_cycle = 0;
+ 			pwm_fan_enable_mode_2_state(val,
+-						    &state,
++						    state,
+ 						    &enable_regulator);
+ 
+-			pwm_fan_apply(ctx, &state);
++			pwm_apply_might_sleep(ctx->pwm, state);
+ 			pwm_fan_switch_power(ctx, enable_regulator);
+ 			pwm_fan_update_state(ctx, 0);
+ 		}
+@@ -591,7 +571,7 @@ static int pwm_fan_probe(struct platform_device *pdev)
+ 	 * Set duty cycle to maximum allowed and enable PWM output as well as
+ 	 * the regulator. In case of error nothing is changed
+ 	 */
+-	ret = set_pwm(ctx, 70);
++	ret = set_pwm(ctx, initial_pwm);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to configure PWM: %d\n", ret);
+ 		return ret;
+@@ -698,15 +678,11 @@ static int pwm_fan_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		ctx->pwm_usec_from_stopped = 250000;
+ 
+-	ret = pwm_fan_register_charger_notifier(dev, ctx);
+-	if (ret)
+-		return ret;
+-
+ 	ctx->info.ops = &pwm_fan_hwmon_ops;
+ 	ctx->info.info = channels;
+ 
+ 	hwmon = devm_hwmon_device_register_with_info(dev, "pwmfan",
+-						     ctx, &ctx->info, pwm_fan_groups);
++						     ctx, &ctx->info, NULL);
+ 	if (IS_ERR(hwmon)) {
+ 		dev_err(dev, "Failed to register hwmon device\n");
+ 		return PTR_ERR(hwmon);
+@@ -741,38 +717,15 @@ static void pwm_fan_shutdown(struct platform_device *pdev)
+ static int pwm_fan_suspend(struct device *dev)
+ {
+ 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+-	int ret = 0;
+ 
+-	mutex_lock(&ctx->lock);
+-	ctx->pwm_awake = ctx->pwm_value;
+-	/* The PWM and supply providers must keep working in s2idle */
+-	if (ctx->pwm_sleep_charging && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+-		ctx->suspended = true;
+-		ctx->charging_valid = false;
+-		ret = pwm_fan_apply_charging(ctx);
+-		if (ret) {
+-			ctx->suspended = false;
+-			__set_pwm(ctx, ctx->pwm_awake);
+-		}
+-	} else {
+-		ret = pwm_fan_power_off(ctx, true);
+-	}
+-	mutex_unlock(&ctx->lock);
+-
+-	return ret;
++	return pwm_fan_power_off(ctx, true);
+ }
+ 
+ static int pwm_fan_resume(struct device *dev)
+ {
+ 	struct pwm_fan_ctx *ctx = dev_get_drvdata(dev);
+-	int ret;
+-
+-	mutex_lock(&ctx->lock);
+-	ctx->suspended = false;
+-	ret = __set_pwm(ctx, ctx->pwm_awake);
+-	mutex_unlock(&ctx->lock);
+ 
+-	return ret;
++	return set_pwm(ctx, ctx->pwm_value);
+ }
+ 
+ static DEFINE_SIMPLE_DEV_PM_OPS(pwm_fan_pm, pwm_fan_suspend, pwm_fan_resume);
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index 79114d552..a708898de 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -3946,13 +3946,6 @@ int ath12k_qmi_event_load_bdf(struct ath12k_qmi *qmi)
+ 		}
+ 	}
+ 
+-	if (!(hw_params->qmi_cnss_feature_bitmap & BIT(CNSS_QDSS_CFG_MISS_V01))) {
+-		ret = ath12k_qmi_wlanfw_qdss_dnld_send(ab);
+-		if (ret < 0) {
+-			ath12k_warn(ab, "qmi failed to send qdss info req: %d\n", ret);
+-			return ret;
+-		}		
+-	}
+ 
+ 	return ret;
+ }
+diff --git a/drivers/usb/dwc3/host.c b/drivers/usb/dwc3/host.c
+index cfabd10e7..b30ba44c9 100644
+--- a/drivers/usb/dwc3/host.c
++++ b/drivers/usb/dwc3/host.c
+@@ -14,9 +14,7 @@
+ #include <linux/usb/hcd.h>
+ #include <linux/bitfield.h>
+ 
+-#include "../host/xhci-port.h"
+-#include "../host/xhci-ext-caps.h"
+-#include "../host/xhci-caps.h"
++#include "../host/xhci.h"
+ #include "../host/xhci-plat.h"
+ #include "core.h"
+ 
+diff --git a/drivers/video/backlight/sy7758.c b/drivers/video/backlight/sy7758.c
+index fbed414a8..0d9d5e460 100644
+--- a/drivers/video/backlight/sy7758.c
++++ b/drivers/video/backlight/sy7758.c
+@@ -214,7 +214,7 @@ static int sy7758_probe(struct i2c_client *client)
+ 	fsleep(100);
+ 
+ 	/* Get enable GPIO and set to high */
+-	sydev->gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_HIGH);
++	sydev->gpio = devm_gpiod_get_optional(dev, "enable", GPIOD_OUT_HIGH);
+ 	if (IS_ERR(sydev->gpio))
+ 		return dev_err_probe(dev, PTR_ERR(sydev->gpio),
+ 				     "failed to get enable GPIO\n");
+diff --git a/sound/soc/codecs/aw882xx/aw882xx.c b/sound/soc/codecs/aw882xx/aw882xx.c
+index 53fecfe0d..efecf2029 100644
+--- a/sound/soc/codecs/aw882xx/aw882xx.c
++++ b/sound/soc/codecs/aw882xx/aw882xx.c
+@@ -78,7 +78,7 @@ static struct aw_componet_codec_ops aw_componet_codec_ops = {
+ 	.codec_get_drvdata = snd_soc_component_get_drvdata,
+ 	.add_codec_controls = snd_soc_add_component_controls,
+ 	.unregister_codec = aw882xx_unregister_component,
+-	.register_codec = snd_soc_register_component, /* 7.2: no _d variant (TB710FU) */
++	.register_codec = snd_soc_register_component_d, /* 7.2: no _d variant (TB710FU) */
+ };
+ #else
+ static struct aw_componet_codec_ops aw_componet_codec_ops = {

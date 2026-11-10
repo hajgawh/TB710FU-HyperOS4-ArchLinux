@@ -1,0 +1,12 @@
+[Unit]
+Description=TB710FU audio event watcher (dmesg + PCM state)
+After=sound.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tb-audio-watch
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

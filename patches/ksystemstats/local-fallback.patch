@@ -1,0 +1,44 @@
+--- a/plugins/gpu/LinuxMsmGpu.cpp	2026-11-02 08:08:03
++++ b/plugins/gpu/LinuxMsmGpu.cpp	2026-11-02 08:08:03
+@@ -218,8 +218,13 @@
+ 
+     const QString descriptorPath = processRoot + QStringLiteral("/fd/") + descriptor;
+     struct stat descriptorStat;
+-    if (stat(QFile::encodeName(descriptorPath).constData(), &descriptorStat) != 0 || !S_ISCHR(descriptorStat.st_mode)
+-        || !m_deviceNumbers.contains(static_cast<quint64>(descriptorStat.st_rdev))) {
++    const bool descriptorStatValid = stat(QFile::encodeName(descriptorPath).constData(), &descriptorStat) == 0;
++
++    // Processes that gained capabilities from a file (for example kwin_wayland
++    // with CAP_SYS_NICE) are non-dumpable, so stat() on their /proc/PID/fd
++    // entries fails with EACCES even when CAP_SYS_PTRACE makes fdinfo readable.
++    // In that case attribute the client through the drm-driver field instead.
++    if (descriptorStatValid && (!S_ISCHR(descriptorStat.st_mode) || !m_deviceNumbers.contains(static_cast<quint64>(descriptorStat.st_rdev)))) {
+         return std::nullopt;
+     }
+ 
+@@ -228,14 +233,21 @@
+         return std::nullopt;
+     }
+ 
+-    struct stat verifiedDescriptorStat;
+-    if (stat(QFile::encodeName(descriptorPath).constData(), &verifiedDescriptorStat) != 0 || descriptorStat.st_rdev != verifiedDescriptorStat.st_rdev
+-        || !S_ISCHR(verifiedDescriptorStat.st_mode) || !m_deviceNumbers.contains(static_cast<quint64>(verifiedDescriptorStat.st_rdev))) {
++    if (descriptorStatValid) {
++        struct stat verifiedDescriptorStat;
++        if (stat(QFile::encodeName(descriptorPath).constData(), &verifiedDescriptorStat) != 0 || descriptorStat.st_rdev != verifiedDescriptorStat.st_rdev
++            || !S_ISCHR(verifiedDescriptorStat.st_mode) || !m_deviceNumbers.contains(static_cast<quint64>(verifiedDescriptorStat.st_rdev))) {
++            return std::nullopt;
++        }
++    }
++
++    const auto sample = linuxMsmClientSample(parseLinuxDrmFdInfo(&fdInfo));
++    if (!descriptorStatValid && !sample) {
+         return std::nullopt;
+     }
+ 
+     valid = true;
+-    return linuxMsmClientSample(parseLinuxDrmFdInfo(&fdInfo));
++    return sample;
+ }
+ 
+ QHash<quint64, quint64> LinuxMsmGpu::readClientEngineTimes(bool discover)

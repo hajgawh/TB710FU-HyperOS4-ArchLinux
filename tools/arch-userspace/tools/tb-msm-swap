@@ -1,0 +1,25 @@
+#!/bin/bash
+# TB710FU: switch the installed msm.ko between the known variants.
+# All of them are built from the same tree with KERNELRELEASE=7.3.0-tb710fu.
+set -eu
+
+D=/lib/modules/7.3.0-tb710fu/kernel/drivers/gpu/drm/msm
+
+case "${1:-}" in
+p0)  SRC="$D/msm.ko.p0" ;;                 # minimal patch (ecee5a82)
+dbg) SRC="$D/msm.ko.dbg" ;;                # minimal + TBDBG probes (9df482ce)
+win) SRC="$D/msm.ko.win" ;;                # minimal + boot-window HPD deferral (0dc54d4f)
+abort) SRC="$D/msm.ko.abort" ;;            # route B': stop stream on alt-mode change (43b775b7)
+v23) SRC="$D/msm.ko.v23-374c602c.bak" ;;   # pre-minimal baseline
+*)
+	echo "usage: $0 p0|dbg|win|abort|v23"
+	exit 1
+	;;
+esac
+
+[ -f "$SRC" ] || { echo "missing $SRC"; exit 1; }
+
+install -m644 "$SRC" "$D/msm.ko"
+depmod -a 7.3.0-tb710fu
+echo "active: $(sha256sum "$D/msm.ko" | cut -d' ' -f1)"
+echo "reboot to take effect"

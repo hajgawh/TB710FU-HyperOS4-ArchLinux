@@ -1,0 +1,33 @@
+#!/bin/bash
+# TB710FU: hold the external DP output off during the boot window, so the
+# first KWin modeset does not race with the Type-C alt-mode/PHY setup.
+set -u
+export XDG_RUNTIME_DIR=/run/user/1001
+export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus
+DP=/sys/class/drm/card1-DP-1
+HOLD=${TB_DP_GATE_SECS:-30}
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*"; }
+
+for _ in $(seq 1 300); do pgrep -x kwin_wayland >/dev/null && break; sleep 0.2; done
+pgrep -x kwin_wayland >/dev/null || { log "bootgate: kwin not found, skip"; exit 0; }
+
+if systemctl stop tb-dp-mode-keep 2>/dev/null; then
+	log "bootgate: mode-keep paused"
+fi
+
+log "bootgate: closed for ${HOLD}s"
+end=$(( $(date +%s) + HOLD ))
+while [ "$(date +%s)" -lt "$end" ]; do
+	if [ "$(cat "$DP/status" 2>/dev/null)" = connected ] &&
+	   [ "$(cat "$DP/enabled" 2>/dev/null)" = enabled ]; then
+		kscreen-doctor output.DP-1.disable >/dev/null 2>&1 && \
+			log "bootgate: DP-1 disabled"
+	fi
+	sleep 0.5
+done
+
+if [ "$(cat "$DP/status" 2>/dev/null)" = connected ]; then
+	kscreen-doctor output.DP-1.enable >/dev/null 2>&1 && log "bootgate: DP-1 enabled"
+fi
+systemctl start tb-dp-mode-keep 2>/dev/null
+log "bootgate: open"

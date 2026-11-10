@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.xiaomi.camera.parallelservice.provider">
+
+    <application
+        android:allowBackup="false"
+        android:hasCode="true"
+        android:label="CameraParallelServiceStub">
+
+        <!--
+          authority 必须与 MiuiCamera 原清单里的字符串逐字节一致：
+          HyperOS 4 相册（libapp_gallery.so / ExternalPhotoPageActivity）按这个
+          authority 解析 provider，解析不到就 abort。
+          改这里 = 等于没装。
+        -->
+        <provider
+            android:name=".SpecialTypesProvider"
+            android:authorities="com.xiaomi.camera.parallelservice.provider.SpecialTypesProvider"
+            android:exported="true"
+            android:grantUriPermissions="true" />
+    </application>
+</manifest>

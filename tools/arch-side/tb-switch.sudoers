@@ -1,0 +1,9 @@
+# TB710FU 双系统切换免密（只放行固定参数；--restore/--force 需要真实 root 密码）
+#
+# 桌面项执行无参数的 switch2os4（写 boot_a + 重启）；--status/--dry 只读；
+# --no-reboot 只写不重启。不要用通配符放行任意参数，否则任何 wheel 用户都能
+# `sudo switch2os4 --restore /tmp/x.img --force` 写入任意 boot 镜像。
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/switch2os4
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/switch2os4 --status
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/switch2os4 --dry
+%wheel ALL=(root) NOPASSWD: /usr/local/bin/switch2os4 --no-reboot

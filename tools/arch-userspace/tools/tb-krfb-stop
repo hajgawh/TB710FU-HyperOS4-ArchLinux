@@ -1,0 +1,2 @@
+#!/bin/sh
+pkill -x krfb && echo "krfb stopped" || echo "krfb not running"

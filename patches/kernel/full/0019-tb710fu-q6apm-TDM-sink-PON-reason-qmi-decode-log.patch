@@ -1,0 +1,87 @@
+From 69f3928e008f70bc09db553ce614ca9b01f4af81 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:04:27 +0000
+Subject: [PATCH 19/27] tb710fu: q6apm TDM sink, PON reason, qmi decode log
+
+---
+ drivers/power/reset/qcom-pon.c          | 22 ++++++++++++++++++++++
+ drivers/soc/qcom/qmi_interface.c        |  4 +++-
+ sound/soc/qcom/qdsp6/q6apm-lpass-dais.c | 17 +++++++++++++++++
+ 3 files changed, 42 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/power/reset/qcom-pon.c b/drivers/power/reset/qcom-pon.c
+index 7e108982a..6fdc5101d 100644
+--- a/drivers/power/reset/qcom-pon.c
++++ b/drivers/power/reset/qcom-pon.c
+@@ -69,6 +69,28 @@ static int qcom_pon_probe(struct platform_device *pdev)
+ 
+ 	reason_shift = (long)of_device_get_match_data(&pdev->dev);
+ 
++	/*
++	 * TB710FU debug: dump the PON block so the reset cause survives to
++	 * userspace.  Mainline never decodes PON_PON_REASON1/2/3, and a
++	 * hardware reset leaves no other trace (no panic, empty pstore).
++	 * Compare the dump of a normal `systemctl reboot` boot against the
++	 * dump of a hard-reset boot to identify the triggering bit.
++	 */
++	{
++		unsigned int v;
++		int i;
++
++		for (i = 0; i < 0x20; i++) {
++			if (!regmap_read(pon->regmap, pon->baseaddr + i, &v))
++				dev_info(&pdev->dev, "TB710FU PON %#06x = 0x%02x\n",
++					 pon->baseaddr + i, v);
++		}
++		if (!regmap_read(pon->regmap,
++				 pon->baseaddr + PON_SOFT_RB_SPARE, &v))
++			dev_info(&pdev->dev, "TB710FU PON %#06x (soft_rb_spare) = 0x%02x\n",
++				 pon->baseaddr + PON_SOFT_RB_SPARE, v);
++	}
++
+ 	if (reason_shift != NO_REASON_SHIFT) {
+ 		pon->reboot_mode.dev = &pdev->dev;
+ 		pon->reason_shift = reason_shift;
+diff --git a/drivers/soc/qcom/qmi_interface.c b/drivers/soc/qcom/qmi_interface.c
+index 16e2e24b6..1cd668681 100644
+--- a/drivers/soc/qcom/qmi_interface.c
++++ b/drivers/soc/qcom/qmi_interface.c
+@@ -502,7 +502,9 @@ static void qmi_handle_message(struct qmi_handle *qmi,
+ 		if (txn->dest && txn->ei) {
+ 			ret = qmi_decode_message(buf, len, txn->ei, txn->dest);
+ 			if (ret < 0)
+-				pr_err("failed to decode incoming message\n");
++				pr_err("TB710FU qmi: decode failed msg_id=0x%x len=%zu txn=%u ret=%d\n",
++				       le16_to_cpu(hdr->msg_id), len,
++				       le16_to_cpu(hdr->txn_id), ret);
+ 
+ 			txn->result = ret;
+ 			complete(&txn->completion);
+diff --git a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+index e204fd59e..97aab1ea3 100644
+--- a/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
++++ b/sound/soc/qcom/qdsp6/q6apm-lpass-dais.c
+@@ -265,6 +265,23 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
+ 		dev_err(dai->dev, "Failed to prepare Graph %d\n", rc);
+ 		goto err;
+ 	}
++
++	/*
++	 * TB710FU: the four AW882xx amps check their PLL against BCLK during
++	 * codec DAPM, before the PCM trigger.  The upstream MI2S workaround
++	 * was removed by the TB710FU patch and never covered TDM, so start
++	 * the TDM playback port here to make BCLK stable before the amps.
++	 */
++	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
++	    dai->id == SECONDARY_TDM_RX_0) {
++		rc = q6apm_graph_start(dai_data->graph[dai->id]);
++		if (rc < 0) {
++			dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
++			goto err;
++		}
++		dai_data->is_port_started[dai->id] = true;
++	}
++
+ 	return 0;
+ err:
+ 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {

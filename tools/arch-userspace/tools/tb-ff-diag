@@ -1,0 +1,40 @@
+#!/bin/sh
+# tb-ff-diag — capture diagnostics while Firefox is still hung.
+# Writes to /home/archlinux/firefox-hang-<timestamp>.log
+set -u
+UID_=$(id -u)
+RT=/run/user/$UID_
+export XDG_RUNTIME_DIR=$RT
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus
+OUT="/home/archlinux/firefox-hang-$(date +%Y%m%d-%H%M%S).log"
+
+pid=$(pgrep -f '^/app/lib/firefox/firefox --name org.mozilla.firefox' | head -1)
+[ -z "$pid" ] && pid=$(pgrep -f '/app/lib/firefox/firefox --name org.mozilla.firefox' | head -1)
+
+{
+  echo "=== $(date)  uptime: $(uptime)"
+  echo "--- memory ---"
+  free -m
+  grep -E 'allocstall|compact_stall|pswp' /proc/vmstat
+  cat /proc/pressure/memory 2>/dev/null
+  echo "--- firefox main pid: ${pid:-NOT RUNNING} ---"
+  if [ -n "$pid" ]; then
+    grep -E 'State|Threads|VmRSS' /proc/"$pid"/status
+    echo "wchan: $(cat /proc/"$pid"/wchan 2>/dev/null)"
+    echo "--- thread states ---"
+    for t in /proc/"$pid"/task/*; do
+      tid=$(basename "$t")
+      printf '%s %-24s %-24s %s\n' "$tid" \
+        "$(cat "$t"/comm 2>/dev/null)" \
+        "$(cat "$t"/wchan 2>/dev/null)" \
+        "$(cat "$t"/syscall 2>/dev/null | cut -d" " -f1-3)"
+    done | head -150
+    echo "--- gdb thread apply all bt (main process) ---"
+    timeout 90 gdb -p "$pid" -batch -ex 'thread apply all bt' 2>&1 | head -3000
+  fi
+  echo "--- kwin/power/portal log, 5min ---"
+  journalctl --since "-5 min" --no-pager 2>/dev/null | grep -viE 'post-quantum' | tail -120
+  echo "--- dmesg ---"
+  dmesg 2>/dev/null | tail -40
+} > "$OUT" 2>&1
+echo "saved: $OUT"

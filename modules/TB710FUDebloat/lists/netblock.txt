@@ -1,0 +1,15 @@
+# TB710FU OS4 网络层兜底清单 v1.5
+#
+# 机制：iptables -m string --hex-string 匹配 DNS 查询包（udp/tcp 53）的 QNAME 并 REJECT。
+# QNAME 是"长度前缀"线格式（点号替换为标签长度字节），所以必须用 hex，不能用明文域名。
+# 格式：域名|线格式hex  （hex 由脚本外生成：每段标签前加长度字节，结尾 00）
+# 生成方法（macOS/Linux）：
+#   python3 -c "d='域名'; b=b''.join(bytes([len(l)])+l.encode() for l in d.split('.'))+b'\x00'; print(b.hex())"
+#
+# 实测（2026-11-07）：4 条全部生效（ping unknown host），对照域名正常。
+# 限制：只拦"域名解析"；已缓存的 IP 连接与 DoH 自带解析不受影响（组件冻结才是主控）。
+
+flash.sec.miui.com|05666c61736803736563046d69756903636f6d00
+fraud-detection.engine.miui.com|0f66726175642d646574656374696f6e06656e67696e65046d69756903636f6d00
+eps.caict.ac.cn|0365707305636169637402616302636e00
+gateway-papa.cloud.weizhi.com|0c676174657761792d7061706105636c6f7564067765697a686903636f6d00

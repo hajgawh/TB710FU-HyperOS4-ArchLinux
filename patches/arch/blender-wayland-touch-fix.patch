@@ -1,0 +1,24 @@
+--- a/intern/ghost/intern/GHOST_SystemWayland.cc
++++ b/intern/ghost/intern/GHOST_SystemWayland.cc
+@@ -3207,7 +3207,9 @@
+  */
+ static void gwl_seat_cursor_buffer_hide(GWL_Seat *seat)
+ {
+-  wl_pointer_set_cursor(seat->wl.pointer, seat->pointer.serial, nullptr, 0, 0);
++  if (seat->wl.pointer) {
++    wl_pointer_set_cursor(seat->wl.pointer, seat->pointer.serial, nullptr, 0, 0);
++  }
+   for (zwp_tablet_tool_v2 *zwp_tablet_tool_v2 : seat->wp.tablet_tools) {
+     GWL_TabletTool *tablet_tool = static_cast<GWL_TabletTool *>(
+         zwp_tablet_tool_v2_get_user_data(zwp_tablet_tool_v2));
+@@ -10647,6 +10649,10 @@
+ 
+   GWL_Seat *seat = gwl_display_seat_active_get(display_);
+   if (!seat) [[unlikely]] {
++    return false;
++  }
++  /* A seat without a pointer (for example touch-only) has nothing to grab. */
++  if (!seat->wl.pointer) [[unlikely]] {
+     return false;
+   }
+   /* No change, success. */

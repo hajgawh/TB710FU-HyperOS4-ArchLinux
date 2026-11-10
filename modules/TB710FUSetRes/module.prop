@@ -1,0 +1,6 @@
+id=tb710fu_setres_noop
+name=TB710FU OS4 运行时桥接
+version=v2.0
+versionCode=11
+author=local
+description=只保留必须 root 的桥：lwky 开关、电池保护→pc_mode、WPS/CAD mslg rootfs、旧版 3198/wmhp 清理。v2.0：panel_direction 跟随屏幕旋转（0/90/180/270→0/1/2/3，修掉写死 3 在 OS4 上的 180° 方向错误）；post-fs-data bind-mount landscape_fullscreen_list.xml（Settings/浏览器进入 magic-window，右边缘贴屏）。v1.9 断网开机时间（epoch+RTC raw）；v1.8 setsid 独立循环；v1.6 support_pen；v1.5 game_mode=2/game_edge=0。字体/R 角/侧滑/刷新率/灵动岛由系统包负责。

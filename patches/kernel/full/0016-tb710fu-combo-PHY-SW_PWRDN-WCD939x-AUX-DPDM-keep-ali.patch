@@ -1,0 +1,965 @@
+From 7795adec2c781383208c2b9528ab4ff2ec9d10cb Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:04:27 +0000
+Subject: [PATCH 16/27] tb710fu: combo PHY SW_PWRDN, WCD939x AUX/DPDM
+ keep-alive, UCSI glink
+
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 193 ++++++--
+ drivers/usb/typec/mux/wcd939x-usbss.c     | 515 +++++++++++++---------
+ drivers/usb/typec/ucsi/ucsi_glink.c       |   9 +
+ 3 files changed, 473 insertions(+), 244 deletions(-)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index c39ced168..3333692fb 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2588,6 +2588,9 @@ struct qmp_combo {
+ 	int init_count;
+ 	enum qmpphy_mode qmpphy_mode;
+ 
++	/* TB710FU: USB3 init waits until the mux routes the combo to USB3 */
++	wait_queue_head_t tb_mode_wq;
++
+ 	struct phy *usb_phy;
+ 	enum phy_mode phy_mode;
+ 	unsigned int usb_init_count;
+@@ -2598,6 +2601,11 @@ struct qmp_combo {
+ 	unsigned int dp_init_count;
+ 	bool dp_powered_on;
+ 
++	/* TB710FU: defer destructive mux switches until DP releases the PHY */
++	bool tb_mux_pending;
++	enum qmpphy_mode tb_pending_mode;
++	struct work_struct tb_mux_work;
++
+ 	struct clk_fixed_rate pipe_clk_fixed;
+ 	struct clk_hw dp_link_hw;
+ 	struct clk_hw dp_pixel_hw;
+@@ -4164,7 +4172,13 @@ static int qmp_combo_dp_exit(struct phy *phy)
+ 
+ 	qmp_combo_com_exit(qmp, false);
+ 
+-	qmp->dp_init_count--;
++	if (qmp->dp_init_count)
++		qmp->dp_init_count--;
++
++	/* Replay a mux switch that was deferred while DP owned the PHY.
++	 * The work runs outside phy_mutex (we hold it here) and re-takes it. */
++	if (!qmp->dp_init_count && qmp->tb_mux_pending)
++		schedule_work(&qmp->tb_mux_work);
+ 
+ 	mutex_unlock(&qmp->phy_mutex);
+ 
+@@ -4214,6 +4228,8 @@ static int qmp_combo_dp_power_off(struct phy *phy)
+ 	return 0;
+ }
+ 
++static void qmp_combo_tb_wait_usb3(struct qmp_combo *qmp);
++
+ static int qmp_combo_usb_power_on(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+@@ -4229,6 +4245,28 @@ static int qmp_combo_usb_power_on(struct phy *phy)
+ 	unsigned int val;
+ 	int ret;
+ 
++	qmp_combo_tb_wait_usb3(qmp);
++
++	/*
++	 * TB710FU: keep the USB3 PCS powered when the DP side still holds a
++	 * reference to the shared COM block.
++	 *
++	 * qmp_combo_com_init() is the only place that sets SW_PWRDN, but it
++	 * returns early as soon as init_count is non-zero - and the DP
++	 * bridge keeps its phy_init() reference across system suspend
++	 * (keep_link).  qmp_combo_usb_power_off() drops SW_PWRDN on the way
++	 * into suspend, so without this the PCS stays powered down,
++	 * PCS_STATUS1.PHYSTATUS never clears and phy_init() fails with
++	 * -ETIMEDOUT on every resume; the first DP commit after resume then
++	 * touches an unpowered PHY and hangs the SoC.
++	 *
++	 * Idempotent on the full-init path (com_init() already set the bit).
++	 * Skipped in DP-only mode, where the USB PCS must stay down.
++	 */
++	if (READ_ONCE(qmp->qmpphy_mode) != QMPPHY_MODE_DP_ONLY)
++		qphy_setbits(pcs, cfg->regs[QPHY_PCS_POWER_DOWN_CONTROL],
++			     SW_PWRDN);
++
+ 	qmp_configure(qmp->dev, serdes, cfg->serdes_tbl, cfg->serdes_tbl_num);
+ 
+ 	/* Tx, Rx, and PCS configurations */
+@@ -4260,15 +4298,18 @@ static int qmp_combo_usb_power_on(struct phy *phy)
+ 			PHY_INIT_COMPLETE_TIMEOUT);
+ 	if (ret) {
+ 		dev_err(qmp->dev, "phy initialization timed-out\n");
+-		goto err_disable_pipe_clk;
++		/*
++		 * TB710FU: do not touch pipe_clk here.  Since f546912bcac6 it
++		 * is owned by qmp_combo_com_init()/qmp_combo_com_exit(), and
++		 * when the COM block is shared with DP this path would
++		 * disable a clock that this call never enabled (and that DP
++		 * is still using), producing the "already disabled" /
++		 * "already unprepared" WARNs on the retry.
++		 */
++		return ret;
+ 	}
+ 
+ 	return 0;
+-
+-err_disable_pipe_clk:
+-	clk_disable_unprepare(qmp->pipe_clk);
+-
+-	return ret;
+ }
+ 
+ static int qmp_combo_usb_power_off(struct phy *phy)
+@@ -4290,11 +4331,33 @@ static int qmp_combo_usb_power_off(struct phy *phy)
+ 	return 0;
+ }
+ 
++/*
++ * TB710FU: block until the Type-C mux has routed the combo PHY to USB3 (or
++ * until USB3DP).  Initializing the USB3 core while the block is still muxed
++ * to DP makes xhci fail with -110 and leaves the PHY in a state that wedges
++ * the bus on the next DP bring-up.
++ */
++static void qmp_combo_tb_wait_usb3(struct qmp_combo *qmp)
++{
++	if (READ_ONCE(qmp->qmpphy_mode) != QMPPHY_MODE_DP_ONLY)
++		return;
++
++	pr_info("TB710FU qmp: USB3 init waiting for mux (mode=%d)\n",
++		qmp->qmpphy_mode);
++	wait_event_timeout(qmp->tb_mode_wq,
++		READ_ONCE(qmp->qmpphy_mode) != QMPPHY_MODE_DP_ONLY,
++		msecs_to_jiffies(1000));
++	pr_info("TB710FU qmp: USB3 init proceeding (mode=%d)\n",
++		qmp->qmpphy_mode);
++}
++
+ static int qmp_combo_usb_init(struct phy *phy)
+ {
+ 	struct qmp_combo *qmp = phy_get_drvdata(phy);
+ 	int ret;
+ 
++	qmp_combo_tb_wait_usb3(qmp);
++
+ 	mutex_lock(&qmp->phy_mutex);
+ 	ret = qmp_combo_com_init(qmp, false);
+ 	if (ret)
+@@ -4801,10 +4864,65 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 	return 0;
+ }
+ 
++static void qmp_combo_apply_mode(struct qmp_combo *qmp, enum qmpphy_mode new_mode)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++
++	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
++		qmp->qmpphy_mode, new_mode);
++
++	qmp->tb_mux_pending = false;
++	qmp->qmpphy_mode = new_mode;
++
++	if (qmp->init_count) {
++		if (qmp->usb_init_count)
++			qmp_combo_usb_power_off(qmp->usb_phy);
++
++		if (qmp->dp_init_count)
++			writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
++
++		qmp_combo_com_exit(qmp, true);
++
++		/* Now everything's powered down, power up the right PHYs */
++		qmp_combo_com_init(qmp, true);
++
++		if (new_mode == QMPPHY_MODE_DP_ONLY) {
++			if (qmp->usb_init_count)
++				qmp->usb_init_count--;
++		}
++
++		if (new_mode == QMPPHY_MODE_USB3DP || new_mode == QMPPHY_MODE_USB3_ONLY) {
++			qmp_combo_usb_power_on(qmp->usb_phy);
++			if (!qmp->usb_init_count)
++				qmp->usb_init_count++;
++		}
++
++		if (new_mode == QMPPHY_MODE_DP_ONLY || new_mode == QMPPHY_MODE_USB3DP) {
++			if (qmp->dp_init_count)
++				cfg->dp_aux_init(qmp);
++		}
++	}
++
++	wake_up_all(&qmp->tb_mode_wq);
++}
++
++static void qmp_combo_tb_mux_work(struct work_struct *work)
++{
++	struct qmp_combo *qmp = container_of(work, struct qmp_combo, tb_mux_work);
++
++	guard(mutex)(&qmp->phy_mutex);
++
++	if (!qmp->tb_mux_pending || qmp->dp_init_count)
++		return;
++
++	qmp->tb_mux_pending = false;
++	if (qmp->tb_pending_mode != qmp->qmpphy_mode)
++		qmp_combo_apply_mode(qmp, qmp->tb_pending_mode);
++}
++
+ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+ {
+ 	struct qmp_combo *qmp = typec_mux_get_drvdata(mux);
+-	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	enum qmpphy_mode new_mode;
+ 	unsigned int svid;
+ 
+@@ -4838,48 +4956,35 @@ static int qmp_combo_typec_mux_set(struct typec_mux_dev *mux, struct typec_mux_s
+ 	}
+ 
+ 	if (new_mode == qmp->qmpphy_mode) {
++		/* The latest firmware state is the current one: any switch we
++		 * deferred earlier is stale. */
++		qmp->tb_mux_pending = false;
+ 		dev_dbg(qmp->dev, "typec_mux_set: same qmpphy mode, bail out\n");
+ 		return 0;
+ 	}
+ 
+-	if (qmp->qmpphy_mode != QMPPHY_MODE_USB3_ONLY && qmp->dp_powered_on) {
+-		dev_dbg(qmp->dev, "typec_mux_set: DP PHY is still in use, delaying switch\n");
++	/*
++	 * Do not power-cycle the whole COM block while the DP PHY is held open.
++	 * The DP driver may be mid init or about to run phy_power_on(); a rebuild
++	 * underneath it leaves the DP PLL dead (-16) and dwc3 then halts on a
++	 * block that is routed to DP (xhci -110).
++	 *
++	 * Switching away from DP (USB3_ONLY) is deferred until dp_exit() drops
++	 * dp_init_count to zero; qmp_combo_tb_mux_work() replays it.  A switch
++	 * that includes DP (DP_ONLY/USB3DP) still has to be applied immediately,
++	 * otherwise DP init would run on a USB3-routed block.
++	 */
++	if (qmp->dp_powered_on ||
++	    (qmp->dp_init_count && new_mode == QMPPHY_MODE_USB3_ONLY)) {
++		qmp->tb_pending_mode = new_mode;
++		qmp->tb_mux_pending = true;
++		dev_dbg(qmp->dev,
++			"typec_mux_set: DP PHY busy (init=%u powered=%d), deferring mode %d\n",
++			qmp->dp_init_count, qmp->dp_powered_on, new_mode);
+ 		return 0;
+ 	}
+ 
+-	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
+-		qmp->qmpphy_mode, new_mode);
+-
+-	qmp->qmpphy_mode = new_mode;
+-
+-	if (qmp->init_count) {
+-		if (qmp->usb_init_count)
+-			qmp_combo_usb_power_off(qmp->usb_phy);
+-
+-		if (qmp->dp_init_count)
+-			writel(DP_PHY_PD_CTL_PSR_PWRDN, qmp->dp_dp_phy + QSERDES_DP_PHY_PD_CTL);
+-
+-		qmp_combo_com_exit(qmp, true);
+-
+-		/* Now everything's powered down, power up the right PHYs */
+-		qmp_combo_com_init(qmp, true);
+-
+-		if (new_mode == QMPPHY_MODE_DP_ONLY) {
+-			if (qmp->usb_init_count)
+-				qmp->usb_init_count--;
+-		}
+-
+-		if (new_mode == QMPPHY_MODE_USB3DP || new_mode == QMPPHY_MODE_USB3_ONLY) {
+-			qmp_combo_usb_power_on(qmp->usb_phy);
+-			if (!qmp->usb_init_count)
+-				qmp->usb_init_count++;
+-		}
+-
+-		if (new_mode == QMPPHY_MODE_DP_ONLY || new_mode == QMPPHY_MODE_USB3DP) {
+-			if (qmp->dp_init_count)
+-				cfg->dp_aux_init(qmp);
+-		}
+-	}
++	qmp_combo_apply_mode(qmp, new_mode);
+ 
+ 	return 0;
+ }
+@@ -5218,6 +5323,8 @@ static int qmp_combo_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 
+ 	mutex_init(&qmp->phy_mutex);
++	init_waitqueue_head(&qmp->tb_mode_wq);
++	INIT_WORK(&qmp->tb_mux_work, qmp_combo_tb_mux_work);
+ 
+ 	ret = qmp_combo_reset_init(qmp);
+ 	if (ret)
+diff --git a/drivers/usb/typec/mux/wcd939x-usbss.c b/drivers/usb/typec/mux/wcd939x-usbss.c
+index 195a8983c..e7fffec45 100644
+--- a/drivers/usb/typec/mux/wcd939x-usbss.c
++++ b/drivers/usb/typec/mux/wcd939x-usbss.c
+@@ -9,6 +9,7 @@
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <linux/regmap.h>
+ #include <linux/bitfield.h>
+ #include <linux/gpio/consumer.h>
+@@ -197,8 +198,27 @@ struct wcd939x_usbss {
+ 	enum typec_orientation orientation;
+ 	unsigned long mode;
+ 	unsigned int svid;
++
++	/* TB710FU: cached analog switch state (see set()) */
++	unsigned int tb_enable;
++	unsigned int tb_select0;
++	unsigned int tb_eq;
++	bool tb_valid;
++	bool tb_dp_active;
++	bool tb_reverse;
++
++	/* TB710FU: deferred apply on the disconnect path */
++	struct delayed_work tb_apply;
+ };
+ 
++/*
++ * TB710FU A/B knob: when set, every set() re-programs the switch block even
++ * if nothing changed.  Default 0 = quiescent.
++ */
++static bool tb_force;
++module_param_named(force_rewrite, tb_force, bool, 0644);
++MODULE_PARM_DESC(force_rewrite, "TB710FU: rewrite switch state on every set() (A/B)");
++
+ static const struct regmap_range_cfg wcd939x_usbss_ranges[] = {
+ 	{
+ 		.range_min = 0,
+@@ -237,42 +257,25 @@ static const struct {
+ 	{ WCD_USBSS_RATIO_SPKR_REXT_R_MSB, GENMASK(6, 0), 0x04 },
+ };
+ 
+-static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
++/*
++ * TB710FU: incremental, quiescent switch programming.
++ *
++ * Upstream clears every switch (AUX, DPDM, SENSE, MIC, AGND), restarts the
++ * audio FSM and re-arms both MG bias boosters on each call, then rebuilds the
++ * requested state.  The vendor driver never does that: it keeps a cached
++ * switch mask and only updates the one group that changed.
++ *
++ * On this board the difference is fatal in a very specific way: closing the
++ * AUX analog switch while the sink is already powered and driving SBU (a hot
++ * re-plug after a DP session) hard-resets the SoC.  AUX and DPDM are
++ * therefore enabled once, at probe (cold), and kept routed for the lifetime
++ * of the driver; a re-plug never has to close them again.
++ */
++
++static int wcd939x_usbss_tb_audio_config(struct wcd939x_usbss *usbss, bool reverse)
+ {
+-	bool reverse = (usbss->orientation == TYPEC_ORIENTATION_REVERSE);
+-	bool enable_audio = false;
+-	bool enable_usb = false;
+-	bool enable_dp = false;
+ 	int ret;
+-
+-	/* USB Mode */
+-	if (usbss->mode < TYPEC_STATE_MODAL ||
+-	    (!usbss->svid && (usbss->mode == TYPEC_MODE_USB2 ||
+-			      usbss->mode == TYPEC_MODE_USB3))) {
+-		enable_usb = true;
+-	} else if (usbss->svid) {
+-		switch (usbss->mode) {
+-		/* DP Only */
+-		case TYPEC_DP_STATE_C:
+-		case TYPEC_DP_STATE_E:
+-			enable_dp = true;
+-			break;
+-
+-		/* DP + USB */
+-		case TYPEC_DP_STATE_D:
+-		case TYPEC_DP_STATE_F:
+-			enable_usb = true;
+-			enable_dp = true;
+-			break;
+-
+-		default:
+-			return -EOPNOTSUPP;
+-		}
+-	} else if (usbss->mode == TYPEC_MODE_AUDIO) {
+-		enable_audio = true;
+-	} else {
+-		return -EOPNOTSUPP;
+-	}
++	int i;
+ 
+ 	/* Disable all switches */
+ 	ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+@@ -328,212 +331,301 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
+ 	/* 35us to allow the SBU switch to turn off */
+ 	usleep_range(35, 1000);
+ 
+-	/* Setup Audio Accessory mux/switch */
+-	if (enable_audio) {
+-		int i;
+-
+-		/*
+-		 * AATC switch configuration:
+-		 * "Normal":
+-		 * - R: DNR
+-		 * - L: DNL
+-		 * - Sense: GSBU2
+-		 * - Mic: MG1
+-		 * - AGND: MG2
+-		 * "Swapped":
+-		 * - R: DNR
+-		 * - L: DNL
+-		 * - Sense: GSBU1
+-		 * - Mic: MG2
+-		 * - AGND: MG1
+-		 * Swapped information is given by the codec MBHC logic
+-		 */
+-
+-		/* Set AATC mode */
+-		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
+-					 WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+-					 FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+-						    WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_AATC));
+-		if (ret)
+-			return ret;
++	/* Set AATC mode */
++	ret = regmap_update_bits(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
++				 WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
++				 FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
++					    WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_AATC));
++	if (ret)
++		return ret;
+ 
+-		/* Select L for DNL_SWITCHES and R for DPR_SWITCHES */
++	/* Select L for DNL_SWITCHES and R for DPR_SWITCHES */
++	ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
++			WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES |
++			WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
++			FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
++				WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_L) |
++			FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
++				WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_R));
++	if (ret)
++		return ret;
++
++	if (reverse)
++		/* Select MG2 for MIC, SBU1 for Sense */
+ 		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-				WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES |
+-				WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+-				FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+-					WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_L) |
+-				FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+-					WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_R));
+-		if (ret)
+-			return ret;
++					 WCD_USBSS_SWITCH_SELECT0_MIC_SWITCHES,
++					 WCD_USBSS_SWITCH_SELECT0_MIC_SWITCHES);
++	else
++		/* Select MG1 for MIC, SBU2 for Sense */
++		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
++					 WCD_USBSS_SWITCH_SELECT0_SENSE_SWITCHES,
++					 WCD_USBSS_SWITCH_SELECT0_SENSE_SWITCHES);
++	if (ret)
++		return ret;
+ 
+-		if (reverse)
+-			/* Select MG2 for MIC, SBU1 for Sense */
+-			ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-						 WCD_USBSS_SWITCH_SELECT0_MIC_SWITCHES,
+-						 WCD_USBSS_SWITCH_SELECT0_MIC_SWITCHES);
+-		else
+-			/* Select MG1 for MIC, SBU2 for Sense */
+-			ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-						 WCD_USBSS_SWITCH_SELECT0_SENSE_SWITCHES,
+-						 WCD_USBSS_SWITCH_SELECT0_SENSE_SWITCHES);
+-		if (ret)
+-			return ret;
++	if (reverse)
++		/* Disable OVP_MG1_BIAS PCOMP_DYN_BST_EN */
++		ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_MG1_BIAS,
++					WCD_USBSS_MG1_BIAS_PCOMP_DYN_BST_EN);
++	else
++		/* Disable OVP_MG2_BIAS PCOMP_DYN_BST_EN */
++		ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_MG2_BIAS,
++					WCD_USBSS_MG2_BIAS_PCOMP_DYN_BST_EN);
++	if (ret)
++		return ret;
+ 
+-		if (reverse)
+-			/* Disable OVP_MG1_BIAS PCOMP_DYN_BST_EN */
+-			ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_MG1_BIAS,
+-						WCD_USBSS_MG1_BIAS_PCOMP_DYN_BST_EN);
+-		else
+-			/* Disable OVP_MG2_BIAS PCOMP_DYN_BST_EN */
+-			ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_MG2_BIAS,
+-						WCD_USBSS_MG2_BIAS_PCOMP_DYN_BST_EN);
+-		if (ret)
+-			return ret;
++	/*  Enable SENSE, MIC switches */
++	ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
++			      WCD_USBSS_SWITCH_SETTINGS_ENABLE_SENSE_SWITCHES |
++			      WCD_USBSS_SWITCH_SETTINGS_ENABLE_MIC_SWITCHES);
++	if (ret)
++		return ret;
+ 
+-		/*  Enable SENSE, MIC switches */
+-		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_SENSE_SWITCHES |
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_MIC_SWITCHES);
+-		if (ret)
+-			return ret;
++	if (reverse)
++		/* Select MG1 for AGND_SWITCHES */
++		ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT1,
++					WCD_USBSS_SWITCH_SELECT1_AGND_SWITCHES);
++	else
++		/* Select MG2 for AGND_SWITCHES */
++		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT1,
++				      WCD_USBSS_SWITCH_SELECT1_AGND_SWITCHES);
++	if (ret)
++		return ret;
+ 
+-		if (reverse)
+-			/* Select MG1 for AGND_SWITCHES */
+-			ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT1,
+-						WCD_USBSS_SWITCH_SELECT1_AGND_SWITCHES);
+-		else
+-			/* Select MG2 for AGND_SWITCHES */
+-			ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT1,
+-					      WCD_USBSS_SWITCH_SELECT1_AGND_SWITCHES);
+-		if (ret)
+-			return ret;
++	/* Enable AGND switches */
++	ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
++			      WCD_USBSS_SWITCH_SETTINGS_ENABLE_AGND_SWITCHES);
++	if (ret)
++		return ret;
+ 
+-		/* Enable AGND switches */
+-		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_AGND_SWITCHES);
+-		if (ret)
+-			return ret;
++	/* Enable DPR, DNL switches */
++	ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
++			      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
++			      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES);
++	if (ret)
++		return ret;
++
++	/* Setup FSM delays */
++	ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_L_SW, 0x02);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_R_SW, 0x02);
++	if (ret)
++		return ret;
++
++	ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_MIC_SW, 0x01);
++	if (ret)
++		return ret;
++
++	/* Start FSM, force write */
++	ret = regmap_write_bits(usbss->regmap, WCD_USBSS_AUDIO_FSM_START,
++				WCD_USBSS_AUDIO_FSM_START_AUDIO_FSM_AUDIO_TRIG,
++				WCD_USBSS_AUDIO_FSM_START_AUDIO_FSM_AUDIO_TRIG);
++	if (ret)
++		return ret;
++
++	/* Default Linearlizer coefficients */
++	for (i = 0; i < ARRAY_SIZE(wcd939x_usbss_coeff_init); ++i)
++		regmap_update_bits(usbss->regmap,
++				   wcd939x_usbss_coeff_init[i].offset,
++				   wcd939x_usbss_coeff_init[i].mask,
++				   wcd939x_usbss_coeff_init[i].value);
+ 
+-		/* Enable DPR, DNL switches */
+-		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES);
++	return 0;
++}
++
++static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
++{
++	bool reverse = (usbss->orientation == TYPEC_ORIENTATION_REVERSE);
++	bool enable_audio = false;
++	bool enable_usb = false;
++	bool enable_dp = false;
++	unsigned int en, sel0, changed, eq;
++	int ret;
++
++	/* USB Mode */
++	if (usbss->mode < TYPEC_STATE_MODAL ||
++	    (!usbss->svid && (usbss->mode == TYPEC_MODE_USB2 ||
++			      usbss->mode == TYPEC_MODE_USB3))) {
++		enable_usb = true;
++	} else if (usbss->svid) {
++		switch (usbss->mode) {
++		/* DP Only */
++		case TYPEC_DP_STATE_C:
++		case TYPEC_DP_STATE_E:
++			enable_dp = true;
++			break;
++
++		/* DP + USB */
++		case TYPEC_DP_STATE_D:
++		case TYPEC_DP_STATE_F:
++			enable_usb = true;
++			enable_dp = true;
++			break;
++
++		default:
++			return -EOPNOTSUPP;
++		}
++	} else if (usbss->mode == TYPEC_MODE_AUDIO) {
++		enable_audio = true;
++	} else {
++		return -EOPNOTSUPP;
++	}
++
++	if (enable_audio) {
++		/* The audio path owns the FSM and the MG bias boosters. */
++		usbss->tb_valid = false;
++		usbss->tb_dp_active = false;
++		return wcd939x_usbss_tb_audio_config(usbss, reverse);
++	}
++
++	/* Remember the last real orientation; NONE must not flip the route. */
++	if (usbss->orientation != TYPEC_ORIENTATION_NONE)
++		usbss->tb_reverse = reverse;
++
++	/*
++	 * TB710FU: AUX and DPDM stay routed for the whole time (except audio).
++	 * Closing AUX on a hot re-plug resets this board, so once closed it is
++	 * never opened again.
++	 */
++	en = WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES |
++	     WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES |
++	     WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXP_TO_MGX_SWITCHES |
++	     WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXM_TO_MGX_SWITCHES;
++
++	sel0 = FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
++			  WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN) |
++	       FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
++			  WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DP) |
++	       (usbss->tb_reverse ? WCD_USBSS_SWITCH_SELECT0_DP_AUXP_SWITCHES
++				  : WCD_USBSS_SWITCH_SELECT0_DP_AUXM_SWITCHES);
++
++	/* Equalizer only matters for SuperSpeed. */
++	eq = (enable_usb && (usbss->mode == TYPEC_MODE_USB3 ||
++			     usbss->mode == TYPEC_DP_STATE_D ||
++			     usbss->mode == TYPEC_DP_STATE_F)) ?
++	     WCD_USBSS_EQUALIZER1_EQ_EN : 0;
++
++	if (!tb_force && usbss->tb_valid && en == usbss->tb_enable &&
++	    sel0 == usbss->tb_select0 && eq == usbss->tb_eq)
++		return 0;
++
++	pr_info("TB710FU usbss: program usb=%d dp=%d rev=%d en=0x%02x sel0=0x%02x eq=%d\n",
++		enable_usb, enable_dp, usbss->tb_reverse, en, sel0, !!eq);
++
++	if (!usbss->tb_valid) {
++		/* First programming after probe, or after an audio accessory. */
++		ret = regmap_update_bits(usbss->regmap,
++				WCD_USBSS_SWITCH_SETTINGS_ENABLE, 0x7f, en);
+ 		if (ret)
+ 			return ret;
+-
+-		/* Setup FSM delays */
+-		ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_L_SW, 0x02);
++		ret = regmap_update_bits(usbss->regmap,
++				WCD_USBSS_SWITCH_SELECT0, 0xff, sel0);
+ 		if (ret)
+ 			return ret;
+-
+-		ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_R_SW, 0x02);
++		ret = regmap_clear_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT1,
++				WCD_USBSS_SWITCH_SELECT1_AGND_SWITCHES);
+ 		if (ret)
+ 			return ret;
+-
+-		ret = regmap_write(usbss->regmap, WCD_USBSS_DELAY_MIC_SW, 0x01);
++		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
++				WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
++				FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
++					   WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_USB));
+ 		if (ret)
+ 			return ret;
+-
+-		/* Start FSM, force write */
+-		ret = regmap_write_bits(usbss->regmap, WCD_USBSS_AUDIO_FSM_START,
+-					WCD_USBSS_AUDIO_FSM_START_AUDIO_FSM_AUDIO_TRIG,
+-					WCD_USBSS_AUDIO_FSM_START_AUDIO_FSM_AUDIO_TRIG);
++		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_EQUALIZER1,
++				WCD_USBSS_EQUALIZER1_EQ_EN, eq);
+ 		if (ret)
+ 			return ret;
+-
+-		/* Default Linearlizer coefficients */
+-		for (i = 0; i < ARRAY_SIZE(wcd939x_usbss_coeff_init); ++i)
+-			regmap_update_bits(usbss->regmap,
+-					   wcd939x_usbss_coeff_init[i].offset,
+-					   wcd939x_usbss_coeff_init[i].mask,
+-					   wcd939x_usbss_coeff_init[i].value);
+-
+-		return 0;
+-	}
+-
+-	ret = regmap_update_bits(usbss->regmap, WCD_USBSS_USB_SS_CNTL,
+-				 WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+-				 FIELD_PREP(WCD_USBSS_USB_SS_CNTL_USB_SS_MODE,
+-					    WCD_USBSS_USB_SS_CNTL_USB_SS_MODE_USB));
+-	if (ret)
+-		return ret;
+-
+-	/* Enable USB muxes */
+-	if (enable_usb) {
+-		/* Do not enable Equalizer in safe mode */
+-		if (usbss->mode != TYPEC_STATE_SAFE) {
+-			ret = regmap_set_bits(usbss->regmap, WCD_USBSS_EQUALIZER1,
+-					      WCD_USBSS_EQUALIZER1_EQ_EN);
++	} else {
++		changed = en ^ usbss->tb_enable;
++		if (changed) {
++			ret = regmap_update_bits(usbss->regmap,
++					WCD_USBSS_SWITCH_SETTINGS_ENABLE,
++					changed, en);
+ 			if (ret)
+ 				return ret;
+ 		}
+ 
+-		/* Select DN for DNL_SWITCHES and DP for DPR_SWITCHES */
+-		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-					 WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES |
+-					 WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+-					 FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DNL_SWITCHES,
+-						    WCD_USBSS_SWITCH_SELECT0_DNL_SWITCH_DN) |
+-					 FIELD_PREP(WCD_USBSS_SWITCH_SELECT0_DPR_SWITCHES,
+-						    WCD_USBSS_SWITCH_SELECT0_DPR_SWITCH_DP));
+-		if (ret)
+-			return ret;
++		changed = sel0 ^ usbss->tb_select0;
++		if (changed) {
++			ret = regmap_update_bits(usbss->regmap,
++					WCD_USBSS_SWITCH_SELECT0,
++					changed, sel0);
++			if (ret)
++				return ret;
++		}
+ 
+-		/* Enable DNL_SWITCHES and DPR_SWITCHES */
+-		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DPR_SWITCHES |
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DNL_SWITCHES);
+-		if (ret)
+-			return ret;
++		if (eq != usbss->tb_eq) {
++			ret = regmap_update_bits(usbss->regmap,
++					WCD_USBSS_EQUALIZER1,
++					WCD_USBSS_EQUALIZER1_EQ_EN, eq);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+-	/* Enable DP AUX muxes */
+-	if (enable_dp) {
+-		/* Update Leakage Canceller Coefficient for AUXP pins */
++	/* DP AUX bias calibration: only needed when DP is (re)entered. */
++	if (enable_dp && !usbss->tb_dp_active) {
+ 		ret = regmap_update_bits(usbss->regmap, WCD_USBSS_DISP_AUXP_CTL,
+-					 WCD_USBSS_DISP_AUXP_CTL_LK_CANCEL_TRK_COEFF,
+-					 FIELD_PREP(WCD_USBSS_DISP_AUXP_CTL_LK_CANCEL_TRK_COEFF,
+-						    5));
++				WCD_USBSS_DISP_AUXP_CTL_LK_CANCEL_TRK_COEFF,
++				FIELD_PREP(WCD_USBSS_DISP_AUXP_CTL_LK_CANCEL_TRK_COEFF,
++					   5));
+ 		if (ret)
+ 			return ret;
+ 
+ 		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_DISP_AUXP_THRESH,
+-				      WCD_USBSS_DISP_AUXP_THRESH_DISP_AUXP_OVPON_CM);
++				WCD_USBSS_DISP_AUXP_THRESH_DISP_AUXP_OVPON_CM);
+ 		if (ret)
+ 			return ret;
++	}
+ 
+-		if (reverse)
+-			/* Select MG2 for AUXP and MG1 for AUXM */
+-			ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXP_SWITCHES |
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXM_SWITCHES,
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXP_SWITCHES);
+-		else
+-			/* Select MG1 for AUXP and MG2 for AUXM */
+-			ret = regmap_update_bits(usbss->regmap, WCD_USBSS_SWITCH_SELECT0,
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXP_SWITCHES |
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXM_SWITCHES,
+-						 WCD_USBSS_SWITCH_SELECT0_DP_AUXM_SWITCHES);
+-		if (ret)
+-			return ret;
++	usbss->tb_enable = en;
++	usbss->tb_select0 = sel0;
++	usbss->tb_eq = eq;
++	usbss->tb_dp_active = enable_dp;
++	usbss->tb_valid = true;
+ 
+-		/* Enable DP_AUXP_TO_MGX and DP_AUXM_TO_MGX switches */
+-		ret = regmap_set_bits(usbss->regmap, WCD_USBSS_SWITCH_SETTINGS_ENABLE,
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXP_TO_MGX_SWITCHES |
+-				      WCD_USBSS_SWITCH_SETTINGS_ENABLE_DP_AUXM_TO_MGX_SWITCHES);
++	return 0;
++}
+ 
+-		/* 15us to allow the SBU switch to turn on again */
+-		usleep_range(15, 1000);
+-	}
++/*
++ * TB710FU: defer the switch write on the disconnect path.
++ *
++ * Tearing the DP stream down and rewriting the WCD939x AUX switches at the
++ * same moment has been observed to hard-reset the tablet (the last log line
++ * before every reset is "wcd939x_usbss_set: enter" on an unplug).  Give the
++ * DP link / NoC 500 ms to settle first; the register end state is identical.
++ */
++static void tb_apply_work(struct work_struct *work)
++{
++	struct wcd939x_usbss *usbss = container_of(to_delayed_work(work),
++						   struct wcd939x_usbss, tb_apply);
++	int ret;
+ 
+-	return 0;
++	mutex_lock(&usbss->lock);
++	ret = wcd939x_usbss_set(usbss);
++	mutex_unlock(&usbss->lock);
++
++	pr_info("TB710FU usbss: deferred disconnect apply ret=%d mode=0x%lx\n",
++		ret, usbss->mode);
++}
++
++static unsigned int tb_defer_ms = 500;
++module_param_named(defer_disconnect_ms, tb_defer_ms, uint, 0644);
++MODULE_PARM_DESC(defer_disconnect_ms,
++		 "Delay before applying the switch state on disconnect (ms)");
++
++static void tb_defer_disconnect(struct wcd939x_usbss *usbss)
++{
++	schedule_delayed_work(&usbss->tb_apply, msecs_to_jiffies(tb_defer_ms));
+ }
+ 
+ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
+ 				    enum typec_orientation orientation)
+ {
++	pr_info("TB710FU usbss: switch_set orientation=%d\n", orientation);
+ 	struct wcd939x_usbss *usbss = typec_switch_get_drvdata(sw);
+ 	int ret = 0;
+ 
+@@ -542,7 +634,14 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
+ 	if (usbss->orientation != orientation) {
+ 		usbss->orientation = orientation;
+ 
+-		ret = wcd939x_usbss_set(usbss);
++		if (orientation == TYPEC_ORIENTATION_NONE && usbss->svid) {
++			/* TB710FU: unplug while DP is live - let it settle first */
++			tb_defer_disconnect(usbss);
++			ret = 0;
++		} else {
++			cancel_delayed_work(&usbss->tb_apply);
++			ret = wcd939x_usbss_set(usbss);
++		}
+ 	}
+ 
+ 	mutex_unlock(&usbss->lock);
+@@ -557,12 +656,16 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
+ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
+ 				 struct typec_mux_state *state)
+ {
++	pr_info("TB710FU usbss: mux_set mode=0x%lx svid=0x%04x\n",
++		state->mode, state->alt ? state->alt->svid : 0);
+ 	struct wcd939x_usbss *usbss = typec_mux_get_drvdata(mux);
+ 	int ret = 0;
+ 
+ 	mutex_lock(&usbss->lock);
+ 
+ 	if (usbss->mode != state->mode) {
++		bool was_dp = (usbss->svid != 0);
++
+ 		usbss->mode = state->mode;
+ 
+ 		if (state->alt)
+@@ -570,7 +673,14 @@ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
+ 		else
+ 			usbss->svid = 0; // No SVID
+ 
+-		ret = wcd939x_usbss_set(usbss);
++		if (was_dp && !state->alt) {
++			/* TB710FU: alt-mode torn down - defer the switch write */
++			tb_defer_disconnect(usbss);
++			ret = 0;
++		} else {
++			cancel_delayed_work(&usbss->tb_apply);
++			ret = wcd939x_usbss_set(usbss);
++		}
+ 	}
+ 
+ 	mutex_unlock(&usbss->lock);
+@@ -700,6 +810,7 @@ static int wcd939x_usbss_probe(struct i2c_client *client)
+ 	if (ret)
+ 		goto err_regulator_disable;
+ 
++	INIT_DELAYED_WORK(&usbss->tb_apply, tb_apply_work);
+ 	sw_desc.drvdata = usbss;
+ 	sw_desc.fwnode = dev_fwnode(dev);
+ 	sw_desc.set = wcd939x_usbss_switch_set;
+@@ -743,6 +854,8 @@ static void wcd939x_usbss_remove(struct i2c_client *client)
+ {
+ 	struct wcd939x_usbss *usbss = i2c_get_clientdata(client);
+ 
++	cancel_delayed_work_sync(&usbss->tb_apply);
++
+ 	typec_mux_unregister(usbss->mux);
+ 	typec_switch_unregister(usbss->sw);
+ 
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 1db0c88d8..9ba438284 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -307,6 +307,8 @@ static void pmic_glink_ucsi_notify(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	dev_info(ucsi->dev, "TB710FU ucsi: notify cci=0x%08x\n", cci);
++
+ 	ucsi_notify_common(ucsi->ucsi, cci);
+ }
+ 
+@@ -336,14 +338,21 @@ static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
+ 
+ 	switch (le32_to_cpu(hdr->opcode)) {
+ 	case UC_UCSI_READ_BUF_REQ:
++		dev_info(ucsi->dev, "TB710FU ucsi: read_buf_req len=%zu\n", len);
+ 		pmic_glink_ucsi_read_ack(ucsi, data, len);
+ 		break;
+ 	case UC_UCSI_WRITE_BUF_REQ:
++		dev_info(ucsi->dev, "TB710FU ucsi: write_buf_req len=%zu\n", len);
+ 		pmic_glink_ucsi_write_ack(ucsi, data, len);
+ 		break;
+ 	case UC_UCSI_USBC_NOTIFY_IND:
++		dev_info(ucsi->dev, "TB710FU ucsi: usbc_notify_ind\n");
+ 		schedule_work(&ucsi->notify_work);
+ 		break;
++	default:
++		dev_info(ucsi->dev, "TB710FU ucsi: opcode=0x%x len=%zu\n",
++			 le32_to_cpu(hdr->opcode), len);
++		break;
+ 	}
+ }
+ 

@@ -1,0 +1,14 @@
+[Unit]
+Description=TB710FU eUSB2 PHY CPBIAS early poke (experiment)
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+ConditionPathExists=/dev/mem
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c "/usr/local/bin/phyreg 0x58 0x2; echo tb-phy58: poked 0x58=0x2 at uptime $(cut -d. -f1 /proc/uptime)s > /dev/kmsg"
+
+[Install]
+WantedBy=sysinit.target

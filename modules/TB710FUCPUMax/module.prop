@@ -1,0 +1,6 @@
+id=tb710fu_cpumax
+name=TB710FU CPU 解锁满频
+version=v1.2
+versionCode=3
+author=local
+description=性能模式：解锁四个 CPU 簇到硬件最大频率，不覆盖 thermal-engine 已生效的热档；切到均衡/省电时只撤销模块写入的满频，之后分别交给 Scene 和澎湃系统。

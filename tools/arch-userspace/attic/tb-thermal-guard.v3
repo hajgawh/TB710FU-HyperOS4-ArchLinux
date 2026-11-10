@@ -1,0 +1,396 @@
+#!/bin/bash
+# tb-thermal-guard v3 - TB710FU userspace thermal governor
+#
+# v3: battery-temperature tiers now bias the CPU control loop instead of only
+#     shifting a discharge band:
+#       38 C yellow  -> target band -3 C, attack x1
+#       39 C red     -> target band -5 C, attack x2, slower release
+#       40 C purple  -> target band -8 C, attack x2, slowest release
+#       40.5 C       -> emergency: clamp to per-cluster floor frequency
+#       40.9 C       -> while charging, stop charge current completely
+#     All tiers use 0.5 C exit hysteresis. The CPU is still controlled by the
+#     same EMA/rate loop; the battery only changes its target and attack gain.
+#
+# v2: rate-based closed loop instead of fixed tiers.
+#   - EMA-filtered die temperature (alpha configurable)
+#   - fast attack: cross the band top -> step down frequency states per tick
+#   - slow release: only below the band bottom, after MIN_HOLD and one state
+#     per RELEASE_INTERVAL seconds
+#
+# Frequency states are the cpufreq cooling-device states (state 0 = highest
+# frequency, increasing state = lower frequency). Verified 2026-11-02:
+#   p0 state4=1804800, p1 state7=2515200, p5 state10=2496000, p5 state0=3302400
+#
+# Modes:
+#   --dry-run  compute and log decisions, never write (default)
+#   --enforce  apply cooling-device states and charge-current limits
+#
+# Stop (systemctl stop / SIGTERM) restores everything this daemon changed.
+# The kernel's 110 C critical trip is never touched.
+
+set -u
+
+CONF=/etc/tb710fu/thermal-guard.conf
+CSV=/var/log/tb-thermal-guard.csv
+LOCK=/run/tb-thermal-guard.lock
+STATEFILE=/run/tb-thermal-guard.state
+
+MODE=dry-run
+case "${1:-}" in
+	--enforce) MODE=enforce ;;
+	--dry-run|"") MODE=dry-run ;;
+	*) echo "usage: $0 [--dry-run|--enforce]" >&2; exit 2 ;;
+esac
+
+# ---- tunables (override in /etc/tb710fu/thermal-guard.conf) -------------
+TARGET=88000            # control target, mC
+BAND=2000               # hold band +/- around target
+HARD_HIGH=96000         # step two states in one tick above this
+EMA_ALPHA=35            # percent weight of the new sample
+RELEASE_INTERVAL=3      # seconds between single release steps
+MIN_HOLD=8              # seconds after an attack before any release
+BATT_T1=38000           # yellow: strengthen the CPU guard
+BATT_T2=39000           # red
+BATT_T3=40000           # purple: large restriction
+BATT_EMERG=40500        # emergency: clamp CPU to the per-cluster floor
+BATT_HARD_STOP=40900    # charging hard stop (end threshold)
+BATT_CRITICAL=40900     # charging last resort: constant_charge_current=0
+BATT_EXIT_HYST=500      # 0.5 C hysteresis on the way down
+SHIFT_1=3000            # effective target band shift (mC)
+SHIFT_2=5000
+SHIFT_3=8000
+SHIFT_EMERG=12000
+ATTACK_STEP_1=1         # cooling-device states per tick
+ATTACK_STEP_2=2
+ATTACK_STEP_3=2
+ATTACK_STEP_EMERG=3
+RELEASE_INT_1=3         # seconds between release steps
+RELEASE_INT_2=5
+RELEASE_INT_3=10
+RELEASE_INT_EMERG=20
+CHG_PCT_1=50            # charge current cap while charging
+CHG_PCT_2=25
+CHG_PCT_3=10
+CHG_PCT_4=2
+MIN_FREQ_0=1100000      # lowest allowed cap per cluster, kHz
+MIN_FREQ_1=1500000
+MIN_FREQ_3=1500000
+MIN_FREQ_5=1600000
+[ -r "$CONF" ] && . "$CONF"
+
+POLICIES="0 1 3 5"
+ZONES_0="cpu0-thermal"
+ZONES_1="cpu3-top-thermal cpu3-bottom-thermal cpu4-top-thermal cpu4-bottom-thermal"
+ZONES_3="cpu5-top-thermal cpu5-bottom-thermal cpu6-top-thermal cpu6-bottom-thermal"
+ZONES_5="cpu7-top-thermal cpu7-middle-thermal cpu7-bottom-thermal"
+
+# ---- helpers ------------------------------------------------------------
+tlog() { printf '%s,%s,%s\n' "$(date '+%FT%T')" "$MODE" "$*" >> "$CSV"; }
+jlog() { printf '%s\n' "$*"; }
+
+declare -A ZP
+build_zone_map() {
+	local z t
+	for z in /sys/class/thermal/thermal_zone*; do
+		t=$(cat "$z/type" 2>/dev/null) || continue
+		ZP[$t]=$z
+	done
+}
+zone_path() {
+	local type=$1
+	[ -n "${ZP[$type]:-}" ] && [ -r "${ZP[$type]}/temp" ] && { printf '%s' "${ZP[$type]}"; return 0; }
+	build_zone_map
+	[ -n "${ZP[$type]:-}" ] || return 1
+	printf '%s' "${ZP[$type]}"
+}
+cdev_path() {
+	local want=$1 c
+	for c in /sys/class/thermal/cooling_device*; do
+		[ "$(cat "$c/type" 2>/dev/null)" = "$want" ] && { printf '%s' "$c"; return 0; }
+	done
+	return 1
+}
+zones_for() {
+	case $1 in
+		0) echo $ZONES_0 ;; 1) echo $ZONES_1 ;;
+		3) echo $ZONES_3 ;; 5) echo $ZONES_5 ;;
+	esac
+}
+max_temp() {
+	local t max=-1000000 z p
+	for t in "$@"; do
+		z=$(zone_path "$t") || continue
+		p=$(cat "$z/temp" 2>/dev/null) || continue
+		[ -n "$p" ] && [ "$p" -gt "$max" ] && max=$p
+	done
+	printf '%s' "$max"
+}
+
+# ---- per-policy frequency tables (descending, state 0 = highest) --------
+declare -A FREQ_DESC MAXSTATE STATE EMA PREV_EMA CDEV FLOOR
+build_freq_desc() { # $1=policy -> "f0 f1 ..."
+	local p=$1 avail hw f out=""
+	hw=$(cat /sys/devices/system/cpu/cpufreq/policy$p/cpuinfo_max_freq 2>/dev/null)
+	[ -n "$hw" ] || return 1
+	avail=$(cat /sys/devices/system/cpu/cpufreq/policy$p/scaling_available_frequencies 2>/dev/null)
+	out="$hw"
+	if [ -n "$avail" ]; then
+		for f in $(echo "$avail" | tr ' ' '\n' | tac); do
+			[ "$f" = "$hw" ] || out="$out $f"
+		done
+	fi
+	printf '%s' "$out"
+}
+freq_at() { # $1=policy $2=state
+	local p=$1 s=$2 i=0 f
+	for f in ${FREQ_DESC[$p]}; do
+		[ "$i" = "$s" ] && { printf '%s' "$f"; return 0; }
+		i=$((i+1))
+	done
+	printf '?'
+}
+state_for_freq() { # $1=policy $2=freq -> lowest state whose freq <= arg
+	local p=$1 want=$2 i=0 f
+	for f in ${FREQ_DESC[$p]}; do
+		[ "$f" -le "$want" ] && { printf '%s' "$i"; return 0; }
+		i=$((i+1))
+	done
+	printf '%s' "${MAXSTATE[$p]}"
+}
+
+# ---- init ---------------------------------------------------------------
+build_zone_map
+for p in $POLICIES; do
+	CDEV[$p]=$(cdev_path "cpufreq-cpu$p" || true)
+	[ -n "${CDEV[$p]}" ] || { jlog "FATAL: no cooling_device cpufreq-cpu$p"; exit 1; }
+	FREQ_DESC[$p]=$(build_freq_desc "$p") || { jlog "FATAL: no freq table for policy$p"; exit 1; }
+	MAXSTATE[$p]=$(cat "${CDEV[$p]}/max_state" 2>/dev/null)
+	[ -n "${MAXSTATE[$p]}" ] || MAXSTATE[$p]=0
+	case $p in
+		0) minf=$MIN_FREQ_0 ;; 1) minf=$MIN_FREQ_1 ;;
+		3) minf=$MIN_FREQ_3 ;; 5) minf=$MIN_FREQ_5 ;;
+	esac
+	FLOOR[$p]=$(state_for_freq "$p" "$minf")
+	[ "${FLOOR[$p]}" -gt "${MAXSTATE[$p]}" ] && FLOOR[$p]=${MAXSTATE[$p]}
+	STATE[$p]=0
+	# shellcheck disable=SC2046
+	t=$(max_temp $(zones_for "$p"))
+	[ "$t" -lt "-100000" ] && t=40000
+	EMA[$p]=$t
+	PREV_EMA[$p]=$t
+done
+
+BATT=/sys/class/power_supply/battery
+CHG_BASE=""
+CHG_OWNED=0
+CHG_END_BASE=""
+CHG_END_OWNED=0
+[ -r "$BATT/constant_charge_current_max" ] && CHG_BASE=$(cat "$BATT/constant_charge_current_max" 2>/dev/null)
+[ -r "$BATT/charge_control_end_threshold" ] && CHG_END_BASE=$(cat "$BATT/charge_control_end_threshold" 2>/dev/null)
+# The driver cache starts at 0 and the session/udev write may land later; treat
+# anything outside 55..100 as "unknown" and fall back to the configured limit so
+# the hard-stop restore can never write 0 (clamped to 55 by the driver).
+case "$CHG_END_BASE" in ''|*[!0-9]*) CHG_END_BASE="" ;; esac
+if [ -n "$CHG_END_BASE" ] && { [ "$CHG_END_BASE" -lt 55 ] || [ "$CHG_END_BASE" -gt 100 ]; }; then
+	CHG_END_BASE=""
+fi
+if [ -z "$CHG_END_BASE" ]; then
+	END_CFG=80
+	[ -r /etc/tb710fu/charge-limit.conf ] && . /etc/tb710fu/charge-limit.conf
+	CHG_END_BASE=${END:-80}
+fi
+
+declare -A LAST_ATTACK LAST_RELEASE LAST_FLOOR
+for p in $POLICIES; do LAST_ATTACK[$p]=0; LAST_RELEASE[$p]=0; done
+
+restore() {
+	[ "$MODE" = enforce ] || return 0
+	local p s
+	for p in $POLICIES; do
+		s=$(cat "${CDEV[$p]}/cur_state" 2>/dev/null)
+		[ "${s:-0}" != 0 ] && echo 0 > "${CDEV[$p]}/cur_state" 2>/dev/null
+	done
+	if [ "$CHG_OWNED" = 1 ] && [ -n "$CHG_BASE" ]; then
+		echo "$CHG_BASE" > "$BATT/constant_charge_current" 2>/dev/null
+	fi
+	if [ "$CHG_END_OWNED" = 1 ] && [ -n "$CHG_END_BASE" ]; then
+		echo "$CHG_END_BASE" > "$BATT/charge_control_end_threshold" 2>/dev/null
+	fi
+	jlog "restored: cooling devices 0, charge current ${CHG_BASE:-unchanged}, charge end ${CHG_END_BASE:-unchanged}"
+}
+trap 'restore; exit 0' INT TERM EXIT
+
+exec 9>"$LOCK" 2>/dev/null || true
+if command -v flock >/dev/null && ! flock -n 9; then
+	jlog "another instance holds $LOCK; exit"; exit 0
+fi
+
+[ -s "$CSV" ] || echo "time,mode,p0,p1,p3,p5,state0,state1,state3,state5,batt,batt_status,batt_tier,chg_pct,cdev_states" >> "$CSV"
+jlog "start mode=$MODE target=$TARGET band=$BAND alpha=$EMA_ALPHA hold=$MIN_HOLD release=$RELEASE_INTERVAL"
+
+batt_tier=0
+last_chg_change=0
+while :; do
+	now=$(date +%s)
+
+	# ---- battery pressure tiers (0.5 C exit hysteresis) ----
+	chg_pct=100
+	bt=0; st=unknown
+	if [ -r "$BATT/temp" ]; then
+		bt_raw=$(cat "$BATT/temp" 2>/dev/null) || bt_raw=0
+		case $bt_raw in ''|*[!0-9-]*) bt_raw=0 ;; esac
+		bt=$((bt_raw * 100))
+		st=$(cat "$BATT/status" 2>/dev/null) || st=unknown
+	fi
+	prev_tier=$batt_tier
+	batt_tier=0
+	shift=0
+	attack_step=1
+	release_interval=$RELEASE_INTERVAL
+	for tier in 4 3 2 1; do
+		case $tier in
+			4) enter=$BATT_EMERG; s=$SHIFT_EMERG; a=$ATTACK_STEP_EMERG; r=$RELEASE_INT_EMERG ;;
+			3) enter=$BATT_T3;    s=$SHIFT_3;     a=$ATTACK_STEP_3;     r=$RELEASE_INT_3 ;;
+			2) enter=$BATT_T2;    s=$SHIFT_2;     a=$ATTACK_STEP_2;     r=$RELEASE_INT_2 ;;
+			1) enter=$BATT_T1;    s=$SHIFT_1;     a=$ATTACK_STEP_1;     r=$RELEASE_INT_1 ;;
+		esac
+		exit_t=$((enter - BATT_EXIT_HYST))
+		if [ "$bt" -ge "$enter" ] || { [ "$prev_tier" -ge "$tier" ] && [ "$bt" -ge "$exit_t" ]; }; then
+			batt_tier=$tier; shift=$s; attack_step=$a; release_interval=$r
+			break
+		fi
+	done
+	if [ "$st" = "Charging" ]; then
+		case $batt_tier in
+			4) chg_pct=$CHG_PCT_4 ;;
+			3) chg_pct=$CHG_PCT_3 ;;
+			2) chg_pct=$CHG_PCT_2 ;;
+			1) chg_pct=$CHG_PCT_1 ;;
+		esac
+		# Last resort: the end-threshold write is not honored by every
+		# charger, so above 40.9 C also cut the charge current to zero.
+		[ "$bt" -ge "$BATT_CRITICAL" ] && chg_pct=0
+	fi
+	high=$((TARGET + BAND - shift))
+	low=$((TARGET - BAND - shift))
+	if [ "$prev_tier" != "$batt_tier" ]; then
+		jlog "battery tier $prev_tier -> $batt_tier (batt=${bt}mC ${st}, shift=${shift}mC, attack=${attack_step}, release=${release_interval}s)"
+	fi
+
+	# ---- control loop ----
+	for p in $POLICIES; do
+		# shellcheck disable=SC2046
+		raw=$(max_temp $(zones_for "$p"))
+		[ "$raw" -lt "-100000" ] && raw=${EMA[$p]}
+		old=${EMA[$p]}
+		ema=$(( (EMA_ALPHA * raw + (100 - EMA_ALPHA) * old) / 100 ))
+		EMA[$p]=$ema
+		slope=$((ema - old))
+		PREV_EMA[$p]=$old
+
+		cur=${STATE[$p]}
+		maxs=${MAXSTATE[$p]}
+		new=$cur
+
+		if [ "$batt_tier" -ge 4 ]; then
+			# Emergency: battery at/above 40.5 C. Clamp to the lowest
+			# frequency this guard allows; normal release resumes after
+			# the battery falls back below 40.0 C.
+			new=${FLOOR[$p]}
+		elif [ "$ema" -ge "$HARD_HIGH" ]; then
+			new=$((cur + 2))
+		elif [ "$ema" -ge "$high" ] || { [ "$ema" -ge "$TARGET" ] && [ "$slope" -ge 2000 ]; }; then
+			new=$((cur + attack_step))
+		elif [ "$ema" -le "$low" ] && [ "$cur" -gt 0 ]; then
+			if [ $((now - ${LAST_ATTACK[$p]})) -ge "$MIN_HOLD" ] && \
+			   [ $((now - ${LAST_RELEASE[$p]})) -ge "$release_interval" ]; then
+				new=$((cur - 1))
+			fi
+		fi
+		if [ "$new" -gt "${FLOOR[$p]}" ]; then
+			new=${FLOOR[$p]}
+			if [ "$ema" -ge "$HARD_HIGH" ] && [ $((now - ${LAST_FLOOR[$p]:-0})) -ge 10 ]; then
+				LAST_FLOOR[$p]=$now
+				jlog "p$p at floor (${FLOOR[$p]}) while ema=$ema; kernel critical is the last resort"
+			fi
+		fi
+		[ "$new" -gt "$maxs" ] && new=$maxs
+		[ "$new" -lt 0 ] && new=0
+
+		if [ "$new" -ne "$cur" ]; then
+			if [ "$new" -gt "$cur" ]; then LAST_ATTACK[$p]=$now; else LAST_RELEASE[$p]=$now; fi
+			STATE[$p]=$new
+			f=$(freq_at "$p" "$new")
+			if [ "$MODE" = enforce ]; then
+				echo "$new" > "${CDEV[$p]}/cur_state" 2>/dev/null
+			fi
+			jlog "p$p state $cur -> $new (${f}kHz, ema=$ema slope=$slope batt=$batt_tier)$([ "$MODE" = dry-run ] && echo ' [dry-run]')"
+		fi
+	done
+
+	# ---- charge current ----
+	if [ "$MODE" = enforce ] && [ -n "$CHG_BASE" ] && { [ "$chg_pct" -eq 0 ] || [ $((now - last_chg_change)) -ge 30 ]; }; then
+		want=$CHG_BASE
+		[ "$chg_pct" -lt 100 ] && want=$((CHG_BASE * chg_pct / 100))
+		real=$(cat "$BATT/constant_charge_current" 2>/dev/null)
+		if [ -n "$real" ]; then
+			if [ "$want" -lt "$real" ]; then
+				echo "$want" > "$BATT/constant_charge_current" 2>/dev/null && {
+					CHG_OWNED=1; last_chg_change=$now
+					jlog "charge current $real -> $want (batt=${bt}mC ${st})"
+				}
+			elif [ "$CHG_OWNED" = 1 ] && [ "$want" -gt "$real" ]; then
+				echo "$want" > "$BATT/constant_charge_current" 2>/dev/null && {
+					last_chg_change=$now
+					jlog "charge current restore $real -> $want"
+				}
+			fi
+		fi
+	fi
+
+	# ---- last-resort charging stop above 40.9 C ----
+	if [ "$MODE" = enforce ] && [ "$st" = "Charging" ] && [ -n "$CHG_END_BASE" ]; then
+		if [ "$CHG_END_OWNED" = 0 ] && [ "$bt" -ge "$BATT_HARD_STOP" ]; then
+			cap=$(cat "$BATT/capacity" 2>/dev/null) || cap=100
+			case $cap in ''|*[!0-9]*) cap=100 ;; esac
+			if echo "$cap" > "$BATT/charge_control_end_threshold" 2>/dev/null; then
+				CHG_END_OWNED=1; last_end_change=$now
+				jlog "HARD STOP charging at batt=${bt}mC: end_threshold=$cap (was $CHG_END_BASE)"
+			fi
+		elif [ "$CHG_END_OWNED" = 1 ] && [ "$bt" -ge "$BATT_HARD_STOP" ] && \
+		     [ $((now - ${last_end_change:-0})) -ge 30 ]; then
+			cap=$(cat "$BATT/capacity" 2>/dev/null) || cap=100
+			case $cap in ''|*[!0-9]*) cap=100 ;; esac
+			echo "$cap" > "$BATT/charge_control_end_threshold" 2>/dev/null && last_end_change=$now
+		fi
+		if [ "$CHG_END_OWNED" = 1 ] && { [ "$bt" -le $((BATT_EMERG - BATT_EXIT_HYST)) ] || [ "$st" != "Charging" ]; }; then
+			echo "$CHG_END_BASE" > "$BATT/charge_control_end_threshold" 2>/dev/null && {
+				CHG_END_OWNED=0
+				jlog "charging re-enabled: end_threshold=$CHG_END_BASE (batt=${bt}mC ${st})"
+			}
+		fi
+	fi
+
+	# ---- state snapshot for the tray applet ----
+	{
+		printf 'time=%s\n' "$now"
+		printf 'mode=%s\n' "$MODE"
+		printf 'batt_temp=%s\n' "$bt"
+		printf 'batt_status=%s\n' "$st"
+		printf 'batt_tier=%s\n' "$batt_tier"
+		printf 'target=%s\n' "$TARGET"
+		printf 'high=%s\n' "$high"
+		printf 'low=%s\n' "$low"
+		printf 'shift=%s\n' "$shift"
+		printf 'chg_pct=%s\n' "$chg_pct"
+		printf 'p0_state=%s\n' "${STATE[0]}"
+		printf 'p1_state=%s\n' "${STATE[1]}"
+		printf 'p3_state=%s\n' "${STATE[3]}"
+		printf 'p5_state=%s\n' "${STATE[5]}"
+		printf 'p5_freq=%s\n' "$(freq_at 5 "${STATE[5]}")"
+	} > "$STATEFILE.tmp" 2>/dev/null && mv -f "$STATEFILE.tmp" "$STATEFILE" 2>/dev/null
+
+	tlog "$(max_temp $ZONES_0),$(max_temp $ZONES_1),$(max_temp $ZONES_3),$(max_temp $ZONES_5),${STATE[0]},${STATE[1]},${STATE[3]},${STATE[5]},${bt:-0},${st:-unknown},${batt_tier},${chg_pct},$(for p in $POLICIES; do printf '%s ' "$(cat ${CDEV[$p]}/cur_state 2>/dev/null)"; done)"
+
+	sleep 1
+done

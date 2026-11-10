@@ -1,0 +1,34 @@
+From 1913f15b5a6962265531c4979c9f2707791a49c4 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 05:56:02 +0000
+Subject: [PATCH 25/27] tb710fu: arm64: dts: sm8650: keep USB1 up across s2idle
+
+Add wakeup-source and qcom,skip-glue-pm-on-suspend to &usb_1. Without them dwc3_core_exit() powers off the HS PHY while the A27U hub is still on the bus; the hub then latches without D+ pull-up until a VBUS cycle.
+---
+ arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+index 7f77bf113..c665e8f81 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+@@ -1204,6 +1204,19 @@
+ 	 * host (USB-C hub with keyboard/mouse).  Without this property dwc3
+ 	 * falls back to peripheral-only ("dr_mode forced to gadget"). */
+ 	usb-role-switch;
++	/*
++	 * TB710FU: keep the dwc3 core and HS PHY powered across s2idle.
++	 * Without wakeup-source, device_may_wakeup() is false and
++	 * dwc3_suspend_common() calls dwc3_core_exit(), which powers off the
++	 * HS PHY while the A27U hub is still on the bus; the hub then latches
++	 * without a D+ pull-up until a VBUS cycle (physical replug).
++	 */
++	wakeup-source;
++	/*
++	 * TB710FU: the A27U built-in hub needs the USB controller/PHY kept
++	 * fully alive across s2idle; see the 2026-11-07 USB suspend report.
++	 */
++	qcom,skip-glue-pm-on-suspend;
+ };
+ 
+ &usb_1_dwc3_hs {

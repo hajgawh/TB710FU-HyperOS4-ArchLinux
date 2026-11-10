@@ -1,0 +1,25 @@
+# TB710FU OS4 反诈组件冻结清单 v1.5.2
+#
+# 格式：包名/组件类名，每行一个，支持 # 注释与空行。
+# 机制：组件级 `pm disable pkg/cls` —— 不走 MIUI_CORE_APPS 包级拦截（2026-11-07 实机验证放行）。
+# 状态持久化在 /data/system/users/0/package-restrictions.xml，重启保留。
+# 恢复：restore.sh 自动 `pm enable pkg/cls`（enable 后会写进 enabledComponents 段=显式启用，
+#       功能等同默认态）；或手动 `pm enable <pkg>/<cls>`。
+# 依据：os4-audit/OS4-反诈监控体系调研报告.md + 实机验证（remote 进程干净重启、无崩溃）。
+#
+# 注意：pm enable 偶发不落盘，restore.sh 对每个组件做 enable 后实证校验（dumpsys 复查）。
+
+# --- 必冻（反诈监听与广播入口）---
+com.miui.securitycenter/com.xiaomi.security.xsof.frauddetection.service.MiFraudDetectionService
+com.miui.securitycenter/com.miui.antifraud.AntiFraudReceiver
+
+# --- 可选（本机天然无效或纯 UI）---
+com.miui.securitycenter/com.miui.antifraud.PayActivityMonitorService
+com.miui.securitycenter/com.xiaomi.security.xsof.frauddetection.provider.FraudDetectionProvider
+com.miui.securitycenter/com.xiaomi.security.xsof.MiSafetyDetectService
+com.miui.guardprovider/com.miui.guardprovider.aiguard.AiGuardService
+
+# --- 交给系统自管（不要冻）---
+# AiGuardPosterActivity：反诈宣传页 UI。安全中心自己会管理它——本机（无通话能力）系统
+# 默认禁用，且 pm enable 后会被系统改回 disabled（2026-11-07 实测两次复现），冻它没有意义。
+# com.miui.securitycenter/com.miui.electricrisk.AiGuardPosterActivity

@@ -1,0 +1,42 @@
+# 构建产物与个人输入不入库
+work/*
+!work/README.md
+
+# 构建缓存/日志
+__pycache__/
+*.pyc
+*.log
+*.tar
+*.img
+*.zip
+*.bundle
+*.apk
+*.jar
+*.ko
+*.bin
+*.melf
+*.zst
+*.mbn
+*.fw
+persist*.img
+modemst*.img
+fsg*.img
+fsc*.img
+tools/venv/
+
+# 双系统配对文件（每台设备唯一，现场生成）
+pair.env
+!tools/os4-switch/pair.env.example
+
+# 个人/设备唯一数据
+*.bak
+*.before-*
+*.orig
+*.pre-*
+
+# macOS
+.DS_Store
+
+# apktool 构建缓存
+assets/overlay-src/*/build/
+*.unsigned.apk

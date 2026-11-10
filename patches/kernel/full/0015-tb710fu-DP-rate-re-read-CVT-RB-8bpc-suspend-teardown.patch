@@ -1,0 +1,845 @@
+From 9d4ace31fbf1635f88b78cf9a8d367e2c06adaaf Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:04:27 +0000
+Subject: [PATCH 15/27] tb710fu: DP rate re-read, CVT-RB 8bpc, suspend
+ teardown, keep_link=0, HPD dedupe
+
+---
+ .../drm/msm/disp/dpu1/dpu_encoder_phys_vid.c  |   7 +-
+ drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h    |   9 +
+ drivers/gpu/drm/msm/dp/dp_aux.c               |  23 ++
+ drivers/gpu/drm/msm/dp/dp_aux.h               |   1 +
+ drivers/gpu/drm/msm/dp/dp_ctrl.c              |  74 +++-
+ drivers/gpu/drm/msm/dp/dp_ctrl.h              |   3 +-
+ drivers/gpu/drm/msm/dp/dp_display.c           | 322 +++++++++++++++++-
+ drivers/gpu/drm/msm/dp/dp_panel.c             |  75 ++++
+ 8 files changed, 488 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+index a3d0d7eb1..ee94b800a 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c
+@@ -616,10 +616,13 @@ static int dpu_encoder_phys_vid_wait_for_commit_done(
+ 		return 0;
+ 
+ 	ret = wait_event_timeout(phys_enc->pending_kickoff_wq,
+-		(hw_ctl->ops.get_flush_register(hw_ctl) == 0),
++		((hw_ctl->ops.get_flush_register(hw_ctl) &
++		  ~DPU_HW_CURSOR_FLUSH_MASK) == 0),
+ 		msecs_to_jiffies(50));
+ 	if (ret <= 0) {
+-		DPU_ERROR("vblank timeout: %x\n", hw_ctl->ops.get_flush_register(hw_ctl));
++		DPU_ERROR("vblank timeout: %x\n",
++			  (u32)(hw_ctl->ops.get_flush_register(hw_ctl) &
++				~DPU_HW_CURSOR_FLUSH_MASK));
+ 		return -ETIMEDOUT;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
+index 35b03eb34..31712a920 100644
+--- a/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
++++ b/drivers/gpu/drm/msm/disp/dpu1/dpu_hw_ctl.h
+@@ -59,6 +59,15 @@ struct dpu_hw_intf_cfg {
+ 	unsigned int dsc;
+ };
+ 
++/*
++ * SSPP_CURSOR0/1 flush bits in CTL_FLUSH. The hardware may leave a cursor
++ * flush bit pending when the cursor SSPP is not scheduled into the active
++ * composition (e.g. after a commit that disables the cursor plane); it only
++ * clears once the cursor SSPP is scheduled again. Commit-done must not gate
++ * on them, or every following commit stalls for the full wait timeout.
++ */
++#define DPU_HW_CURSOR_FLUSH_MASK (BIT(22) | BIT(23))
++
+ /**
+  * struct dpu_hw_ctl_ops - Interface to the wb Hw driver functions
+  * Assumption is these functions will be called after clocks are enabled
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.c b/drivers/gpu/drm/msm/dp/dp_aux.c
+index 3825a2fb4..0d2fb1fbd 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.c
++++ b/drivers/gpu/drm/msm/dp/dp_aux.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/delay.h>
+ #include <linux/iopoll.h>
++#include <linux/jiffies.h>
+ #include <linux/phy/phy.h>
+ #include <drm/drm_print.h>
+ 
+@@ -40,6 +41,7 @@ struct msm_dp_aux_private {
+ 	bool initted;
+ 	bool is_edp;
+ 	bool enable_xfers;
++	unsigned long tb_budget_end;
+ 	u32 offset;
+ 	u32 segment;
+ 
+@@ -390,6 +392,19 @@ static ssize_t msm_dp_aux_transfer(struct drm_dp_aux *msm_dp_aux,
+ 		goto exit;
+ 	}
+ 
++	/*
++	 * TB710FU: the link bring-up arms a total budget before it starts
++	 * talking to the sink.  Without it a dead AUX PHY turns every DPCD
++	 * message into 32 x 250 ms of retries inside drm_dp_dpcd_access(),
++	 * which wedges the atomic commit thread for far longer than the PMIC
++	 * watchdog tolerates.  Once the budget is gone, fail fast so the
++	 * commit can finish (DP stays off until the next real plug).
++	 */
++	if (aux->tb_budget_end && time_after(jiffies, aux->tb_budget_end)) {
++		ret = -ETIMEDOUT;
++		goto exit;
++	}
++
+ 	msm_dp_aux_update_offset_and_segment(aux, msg);
+ 	msm_dp_aux_transfer_helper(aux, msg, true);
+ 
+@@ -507,6 +522,14 @@ void msm_dp_aux_enable_xfers(struct drm_dp_aux *msm_dp_aux, bool enabled)
+ 	aux->enable_xfers = enabled;
+ }
+ 
++void msm_dp_aux_set_budget(struct drm_dp_aux *msm_dp_aux, unsigned int ms)
++{
++	struct msm_dp_aux_private *aux;
++
++	aux = container_of(msm_dp_aux, struct msm_dp_aux_private, msm_dp_aux);
++	aux->tb_budget_end = ms ? jiffies + msecs_to_jiffies(ms) : 0;
++}
++
+ void msm_dp_aux_reconfig(struct drm_dp_aux *msm_dp_aux)
+ {
+ 	struct msm_dp_aux_private *aux;
+diff --git a/drivers/gpu/drm/msm/dp/dp_aux.h b/drivers/gpu/drm/msm/dp/dp_aux.h
+index 4be02e8b4..9bc699cec 100644
+--- a/drivers/gpu/drm/msm/dp/dp_aux.h
++++ b/drivers/gpu/drm/msm/dp/dp_aux.h
+@@ -12,6 +12,7 @@ int msm_dp_aux_register(struct drm_dp_aux *msm_dp_aux);
+ void msm_dp_aux_unregister(struct drm_dp_aux *msm_dp_aux);
+ irqreturn_t msm_dp_aux_isr(struct drm_dp_aux *msm_dp_aux, u32 isr);
+ void msm_dp_aux_enable_xfers(struct drm_dp_aux *msm_dp_aux, bool enabled);
++void msm_dp_aux_set_budget(struct drm_dp_aux *msm_dp_aux, unsigned int ms);
+ void msm_dp_aux_init(struct drm_dp_aux *msm_dp_aux);
+ void msm_dp_aux_deinit(struct drm_dp_aux *msm_dp_aux);
+ void msm_dp_aux_reconfig(struct drm_dp_aux *msm_dp_aux);
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.c b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+index 59070f399..e755a252f 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.c
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.c
+@@ -139,6 +139,10 @@ struct msm_dp_ctrl_private {
+ 	bool core_clks_on;
+ 	bool link_clks_on;
+ 	bool stream_clks_on;
++
++	/* TB710FU P1: count phy_power_on() refs so exit/init never see a
++	 * stale ref (a single connection can power the PHY more than once). */
++	unsigned int phy_power_refs;
+ };
+ 
+ static inline u32 msm_dp_read_ahb(const struct msm_dp_ctrl_private *ctrl, u32 offset)
+@@ -1836,7 +1840,12 @@ static int msm_dp_ctrl_enable_mainlink_clocks(struct msm_dp_ctrl_private *ctrl,
+ 	ctrl->phy_opts.dp.ssc = drm_dp_max_downspread(dpcd);
+ 
+ 	phy_configure(phy, &ctrl->phy_opts);
+-	phy_power_on(phy);
++	ret = phy_power_on(phy);
++	if (ret) {
++		DRM_ERROR("DP PHY power-on failed: %d\n", ret);
++		return ret;
++	}
++	ctrl->phy_power_refs++;
+ 
+ 	dev_pm_opp_set_rate(ctrl->dev, ctrl->link->link_params.rate * 1000);
+ 	ret = msm_dp_ctrl_link_clk_enable(&ctrl->msm_dp_ctrl);
+@@ -1955,16 +1964,47 @@ static void msm_dp_ctrl_phy_reset(struct msm_dp_ctrl_private *ctrl)
+ 	msm_dp_write_ahb(ctrl, REG_DP_PHY_CTRL, 0x0);
+ }
+ 
+-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
++static void msm_dp_ctrl_phy_power_off(struct msm_dp_ctrl_private *ctrl)
++{
++	if (!ctrl->phy_power_refs)
++		return;
++
++	phy_power_off(ctrl->phy);
++	ctrl->phy_power_refs--;
++}
++
++static void msm_dp_ctrl_phy_power_off_all(struct msm_dp_ctrl_private *ctrl)
++{
++	while (ctrl->phy_power_refs)
++		msm_dp_ctrl_phy_power_off(ctrl);
++}
++
++bool msm_dp_ctrl_link_clks_on(struct msm_dp_ctrl *msm_dp_ctrl)
++{
++	struct msm_dp_ctrl_private *ctrl;
++
++	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
++
++	return ctrl->link_clks_on;
++}
++
++int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+ 	struct phy *phy;
++	int ret;
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 	phy = ctrl->phy;
+ 
++	msm_dp_ctrl_phy_power_off_all(ctrl);
++
+ 	msm_dp_ctrl_phy_reset(ctrl);
+-	phy_init(phy);
++	ret = phy_init(phy);
++	if (ret)
++		DRM_ERROR("DP PHY init failed: %d\n", ret);
++
++	return ret;
+ }
+ 
+ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
+@@ -1975,6 +2015,8 @@ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 	phy = ctrl->phy;
+ 
++	msm_dp_ctrl_phy_power_off_all(ctrl);
++
+ 	msm_dp_ctrl_phy_reset(ctrl);
+ 	phy_exit(phy);
+ }
+@@ -1996,7 +2038,7 @@ static int msm_dp_ctrl_reinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
+ 	 */
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+ 
+-	phy_power_off(phy);
++	msm_dp_ctrl_phy_power_off(ctrl);
+ 	/* hw recommended delay before re-enabling clocks */
+ 	msleep(20);
+ 
+@@ -2022,7 +2064,7 @@ static int msm_dp_ctrl_deinitialize_mainlink(struct msm_dp_ctrl_private *ctrl,
+ 
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+ 
+-	phy_power_off(phy);
++	msm_dp_ctrl_phy_power_off(ctrl);
+ 
+ 	/* aux channel down, reinit phy */
+ 	phy_exit(phy);
+@@ -2434,6 +2476,18 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 	if (ctrl->link->sink_request & DP_TEST_LINK_PHY_TEST_PATTERN)
+ 		return rc;
+ 
++	/*
++	 * TB710FU: backport of 7.4-rc1 a47987366e7f (Oleg Keri).  If the
++	 * retry loop ran out, the last msm_dp_ctrl_reinitialize_mainlink()
++	 * returned 0 and rc is still 0.  Do not report that as "trained":
++	 * the caller would start a stream on a link that never completed
++	 * channel equalization (healthy-looking dp_debug, black screen).
++	 */
++	if (!link_train_max_retries) {
++		pr_info("TB710FU DP: link training exhausted, reporting failure\n");
++		rc = -ETIMEDOUT;
++	}
++
+ 	if (rc == 0) {  /* link train successfully */
+ 		/*
+ 		 * do not stop train pattern here
+@@ -2447,6 +2501,10 @@ int msm_dp_ctrl_on_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		 */
+ 		msm_dp_ctrl_clear_training_pattern(ctrl, panel, DP_PHY_DPRX);
+ 
++		pr_info("TB710FU DP: link training failed rc=%d rate=%u lanes=%u\n",
++			rc, ctrl->link->link_params.rate,
++			ctrl->link->link_params.num_lanes);
++
+ 		msm_dp_ctrl_deinitialize_mainlink(ctrl, panel);
+ 		rc = -ECONNRESET;
+ 	}
+@@ -2634,6 +2692,8 @@ void msm_dp_ctrl_reinit_phy(struct msm_dp_ctrl *msm_dp_ctrl)
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+ 	phy = ctrl->phy;
+ 
++	msm_dp_ctrl_phy_power_off(ctrl);
++
+ 	/* aux channel down, reinit phy */
+ 	phy_exit(phy);
+ 	phy_init(phy);
+@@ -2643,10 +2703,8 @@ void msm_dp_ctrl_off_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 			  struct msm_dp_panel *panel)
+ {
+ 	struct msm_dp_ctrl_private *ctrl;
+-	struct phy *phy;
+ 
+ 	ctrl = container_of(msm_dp_ctrl, struct msm_dp_ctrl_private, msm_dp_ctrl);
+-	phy = ctrl->phy;
+ 
+ 	msm_dp_panel_disable_vsc_sdp(panel);
+ 
+@@ -2656,7 +2714,7 @@ void msm_dp_ctrl_off_link(struct msm_dp_ctrl *msm_dp_ctrl,
+ 
+ 	msm_dp_ctrl_link_clk_disable(&ctrl->msm_dp_ctrl);
+ 
+-	phy_power_off(phy);
++	msm_dp_ctrl_phy_power_off(ctrl);
+ }
+ 
+ irqreturn_t msm_dp_ctrl_isr(struct msm_dp_ctrl *msm_dp_ctrl,
+diff --git a/drivers/gpu/drm/msm/dp/dp_ctrl.h b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+index 5902cf7e7..aac041c67 100644
+--- a/drivers/gpu/drm/msm/dp/dp_ctrl.h
++++ b/drivers/gpu/drm/msm/dp/dp_ctrl.h
+@@ -39,7 +39,8 @@ struct msm_dp_ctrl *msm_dp_ctrl_get(struct device *dev,
+ 
+ void msm_dp_ctrl_reset(struct msm_dp_ctrl *msm_dp_ctrl,
+ 		       struct msm_dp_panel *panel);
+-void msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
++int msm_dp_ctrl_phy_init(struct msm_dp_ctrl *msm_dp_ctrl);
++bool msm_dp_ctrl_link_clks_on(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+ void msm_dp_ctrl_irq_phy_exit(struct msm_dp_ctrl *msm_dp_ctrl);
+ 
+diff --git a/drivers/gpu/drm/msm/dp/dp_display.c b/drivers/gpu/drm/msm/dp/dp_display.c
+index 65f5d829c..f88a3531d 100644
+--- a/drivers/gpu/drm/msm/dp/dp_display.c
++++ b/drivers/gpu/drm/msm/dp/dp_display.c
+@@ -12,6 +12,7 @@
+ #include <linux/phy/phy.h>
+ #include <linux/delay.h>
+ #include <linux/string_choices.h>
++#include <linux/suspend.h>
+ #include <drm/display/drm_dp_aux_bus.h>
+ #include <drm/display/drm_hdmi_audio_helper.h>
+ #include <drm/drm_edid.h>
+@@ -338,7 +339,9 @@ static bool msm_dp_display_host_phy_init(struct msm_dp_display_private *dp)
+ 		dp->phy_initialized);
+ 
+ 	if (!dp->phy_initialized) {
+-		msm_dp_ctrl_phy_init(dp->ctrl);
++		if (msm_dp_ctrl_phy_init(dp->ctrl))
++			/* PHY stayed off; do not pretend it is ready. */
++			return false;
+ 		dp->phy_initialized = true;
+ 		return true;
+ 	}
+@@ -623,6 +626,76 @@ static int msm_dp_display_set_mode(struct msm_dp *msm_dp_display,
+ 	return 0;
+ }
+ 
++/*
++ * TB710FU: every physical re-plug makes the firmware announce more than one
++ * alt-mode state within ~1 s (DP -> USB -> DP, each step power-cycling the
++ * shared QMP COM block).  If that lands while the DP PHY is starting up,
++ * phy_configure()/phy_power_on() still return 0 but the DP PLL never locks:
++ * dispcc then reports "disp_cc_mdss_dptx0_link_clk status stuck at 'off'"
++ * and msm_dp_ctrl_on_link() fails with -16.  A single such failure used to
++ * be logged and ignored, which left the DPU video encoder enabled and
++ * waiting for a vblank that never arrives (thousands of "vblank timeout",
++ * recoverable only by reboot).  Retry with a full teardown: phy_exit() and
++ * phy_init() are what give the next attempt a clean
++ * phy_init -> phy_configure -> phy_power_on run, which re-programs the PHY
++ * for the settled orientation/lane assignment.
++ */
++static unsigned int link_retries = 5;
++module_param(link_retries, uint, 0644);
++MODULE_PARM_DESC(link_retries, "TB710FU: attempts to bring the DP link up");
++
++static unsigned int link_retry_ms = 200;
++module_param(link_retry_ms, uint, 0644);
++MODULE_PARM_DESC(link_retry_ms, "TB710FU: delay between link bring-up attempts");
++
++/*
++ * TB710FU: total AUX budget for one link bring-up (0 disables the guard).
++ * A dead AUX PHY used to turn every DPCD message into 32 x 250 ms of
++ * retries and wedge the atomic commit thread past the PMIC watchdog.
++ */
++static unsigned int tb_link_budget_ms = 3000;
++module_param(tb_link_budget_ms, uint, 0644);
++MODULE_PARM_DESC(tb_link_budget_ms, "TB710FU: AUX budget for one link bring-up (ms)");
++
++static int msm_dp_display_on_link(struct msm_dp_display_private *dp)
++{
++	unsigned int tries = link_retries ? link_retries : 1;
++	unsigned int attempt;
++	int rc;
++
++	for (attempt = 0; attempt < tries; attempt++) {
++		/* Wake the sink before (re)training: after a DPMS off it may sit
++		 * in DPCD D3 and only leaves it on a SET_POWER transition.  This
++		 * must run after the PHY is up. */
++		msm_dp_link_psm_config(dp->link, &dp->panel->link_info, false);
++
++		rc = msm_dp_ctrl_on_link(dp->ctrl, dp->panel);
++		if (!rc)
++			return 0;
++
++		if (attempt == tries - 1)
++			break;
++
++		DRM_INFO("TB710FU: link bring-up failed rc=%d, retrying %u/%u\n",
++			  rc, attempt + 1, tries - 1);
++
++		msm_dp_ctrl_off_link(dp->ctrl, dp->panel);
++		msm_dp_display_host_phy_exit(dp);
++
++		msleep(link_retry_ms);
++
++		msm_dp_display_host_phy_init(dp);
++		if (!dp->phy_initialized)
++			break;
++	}
++
++	/* Leave the PHY off so the next enable starts from a clean init. */
++	msm_dp_ctrl_off_link(dp->ctrl, dp->panel);
++	msm_dp_display_host_phy_exit(dp);
++
++	return rc;
++}
++
+ static int msm_dp_display_prepare_link(struct msm_dp_display_private *dp)
+ {
+ 	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
+@@ -644,18 +717,32 @@ static int msm_dp_display_prepare_link(struct msm_dp_display_private *dp)
+ 		return -ENOTCONN;
+ 
+ 	if (!msm_dp_display->power_on) {
++		/*
++		 * The plug handler may have initialised the PHY already; the
++		 * flag, not the return value, is what matters here.  The flag
++		 * is cleared on system suspend (see msm_dp_pm_runtime_suspend),
++		 * so this really runs phy_init() on the resume path.
++		 */
+ 		msm_dp_display_host_phy_init(dp);
++		if (!dp->phy_initialized) {
++			/* never power on a PHY that failed to init */
++			pm_runtime_put_sync(&msm_dp_display->pdev->dev);
++			return -EIO;
++		}
+ 		force_link_train = true;
+ 	}
+ 
+-	rc = msm_dp_ctrl_on_link(dp->ctrl, dp->panel);
++	msm_dp_aux_set_budget(dp->aux, tb_link_budget_ms);
++	rc = msm_dp_display_on_link(dp);
++	msm_dp_aux_set_budget(dp->aux, 0);
+ 	if (rc) {
+ 		DRM_ERROR("Failed link training (rc=%d)\n", rc);
+ 		// TODO: schedule drm_connector_set_link_status_property()
+ 		return rc;
+ 	}
+ 
+-	return msm_dp_ctrl_prepare_stream_on(dp->ctrl, dp->panel, force_link_train);
++	rc = msm_dp_ctrl_prepare_stream_on(dp->ctrl, dp->panel, force_link_train);
++	return rc;
+ }
+ 
+ static int msm_dp_display_enable(struct msm_dp_display_private *dp,
+@@ -716,29 +803,95 @@ static void msm_dp_display_audio_notify_disable(struct msm_dp_display_private *d
+ 	msm_dp_display->audio_enabled = false;
+ }
+ 
++/*
++ * TB710FU: the A27U deasserts HPD 1-2 min after the link disappears and only
++ * a physical re-plug brings it back, so on DPMS off we keep the main link and
++ * the PHY alive while the sink stays attached.
++ *
++ * We must still put the sink itself into D3: leaving it in D0 with the link up
++ * but no video stream keeps the monitor half-awake, and it re-shows its
++ * "no signal / entering standby" OSD every ~27 s (measured 2026-11-06).
++ *
++ * This is only valid while the sink is really attached: link->sink_count is
++ * stale on HPD unplug (it is refreshed when the caps are read on the next
++ * connect), so dp->plugged is the "the cable is gone" signal.
++ *
++ * keep_link=1 keeps the link/PHY up on DPMS off and only puts the sink into
++ * D3; measured 2026-11-06 that is NOT enough for the A27U: as long as the
++ * DPTX keeps driving the main link, the monitor keeps waking up and re-shows
++ * its "no signal / entering standby" OSD, even though the sink itself is in
++ * D3.  Only a full teardown (link clocks off + phy_exit) makes it stay quiet,
++ * so that is the default now; tb-dp-wake-fix renegotiates the alt mode on
++ * wake if the monitor dropped HPD in the meantime.
++ */
++static bool keep_link;
++module_param(keep_link, bool, 0644);
++MODULE_PARM_DESC(keep_link, "TB710FU: keep DP link/PHY alive on DPMS off (A/B; A27U keeps waking up)");
++
+ static int msm_dp_display_disable(struct msm_dp_display_private *dp,
+ 				  struct msm_dp_panel *msm_dp_panel)
+ {
+ 	struct msm_dp *msm_dp_display = &dp->msm_dp_display;
++	bool sink_attached = dp->plugged && dp->link->sink_count > 0;
+ 
+-	if (!msm_dp_display->power_on)
++	if (!msm_dp_display->power_on) {
++		if (dp->phy_initialized && (!sink_attached || !keep_link)) {
++			if (sink_attached)
++				msm_dp_link_psm_config(dp->link,
++						       &msm_dp_panel->link_info,
++						       true);
++			if (msm_dp_ctrl_link_clks_on(dp->ctrl))
++				msm_dp_ctrl_off_link(dp->ctrl, msm_dp_panel);
++			msm_dp_display_host_phy_exit(dp);
++		}
+ 		return 0;
++	}
+ 
+ 	msm_dp_panel_disable_vsc_sdp(msm_dp_panel);
+ 
+ 	msm_dp_ctrl_off_pixel_clk(dp->ctrl);
+ 
+-	/* dongle is still connected but sinks are disconnected */
+-	if (dp->link->sink_count == 0)
++	if (!sink_attached) {
++		/*
++		 * Cable is gone: there is no AUX partner left to talk to, so skip
++		 * the DPCD D3 write and tear the link down locally.
++		 *
++		 * Use phy_exit() here, NOT msm_dp_ctrl_reinit_phy(): a back-to-back
++		 * exit+init leaves the combo PHY such that the DP PLL never starts
++		 * on the next enable and dispcc reports
++		 * "disp_cc_mdss_dptx0_link_clk status stuck at 'off'" (-16).
++		 * Exiting now lets the next connect run a fresh
++		 * phy_init() -> phy_configure() -> phy_power_on() cycle.
++		 */
++		msm_dp_ctrl_off_link(dp->ctrl, msm_dp_panel);
++		msm_dp_display_host_phy_exit(dp);
++	} else if (keep_link) {
++		/*
++		 * Sink still attached, only the stream stopped (DPMS off): keep
++		 * the main link, its clocks and the PHY alive so HPD stays
++		 * asserted, but put the sink into D3 so the monitor really
++		 * enters standby.  Leaving it in D0 (old behaviour) kept the
++		 * monitor half-awake and it re-showed its "no signal / entering
++		 * standby" OSD every ~27 s.
++		 *
++		 * The next enable runs msm_dp_display_on_link(), which powers
++		 * the sink back up (SET_POWER=D0) and retrains from scratch.
++		 */
+ 		msm_dp_link_psm_config(dp->link, &msm_dp_panel->link_info, true);
+-
+-	msm_dp_ctrl_off_link(dp->ctrl, msm_dp_panel);
+-
+-	if (dp->link->sink_count == 0)
+-		/* re-init the PHY so that we can listen to Dongle disconnect */
+-		msm_dp_ctrl_reinit_phy(dp->ctrl);
+-	else
++	} else {
++		/*
++		 * Full power-down: drop the link and exit the PHY.
++		 *
++		 * Do NOT use msm_dp_ctrl_reinit_phy(): a back-to-back exit+init
++		 * leaves the combo PHY such that the DP PLL never starts on the
++		 * next enable (dispcc reports "disp_cc_mdss_dptx0_link_clk
++		 * status stuck at 'off'").  Exiting now lets the next enable run
++		 * a fresh phy_init() -> phy_configure() -> phy_power_on() cycle.
++		 */
++		msm_dp_link_psm_config(dp->link, &msm_dp_panel->link_info, true);
++		msm_dp_ctrl_off_link(dp->ctrl, msm_dp_panel);
+ 		msm_dp_display_host_phy_exit(dp);
++	}
+ 
+ 	msm_dp_display->power_on = false;
+ 
+@@ -790,6 +943,16 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
+ 	if (mode_pclk_khz > DP_MAX_PIXEL_CLK_KHZ)
+ 		return MODE_CLOCK_HIGH;
+ 
++	/*
++	 * TB710FU: on a 2-lane link do not accept a timing that only fits by
++	 * dropping below 8 bpc.  msm_dp_panel_get_mode_bpp() would silently
++	 * fall back to 6 bpc, and the A27U rejects 6-bit input (black screen).
++	 * mode_valid() is what stops a stale KWin mode from being applied.
++	 */
++	if (link_info->num_lanes == 2 && link_info->rate &&
++	    (u64)link_pclk_khz * 24 > (u64)link_info->rate * 2 * 8)
++		return MODE_BAD;
++
+ 	mode_bpp = dp->connector->display_info.bpc * num_components;
+ 	if (!mode_bpp)
+ 		mode_bpp = default_bpp;
+@@ -809,6 +972,10 @@ enum drm_mode_status msm_dp_display_mode_valid(struct msm_dp *dp,
+ int msm_dp_display_get_modes(struct msm_dp *dp)
+ {
+ 	struct msm_dp_display_private *msm_dp_display;
++	struct msm_dp_link_info *link_info;
++	struct drm_connector *connector;
++	struct drm_display_mode *mode, *tmp;
++	int ret;
+ 
+ 	if (!dp) {
+ 		DRM_ERROR("invalid params\n");
+@@ -816,8 +983,73 @@ int msm_dp_display_get_modes(struct msm_dp *dp)
+ 	}
+ 
+ 	msm_dp_display = container_of(dp, struct msm_dp_display_private, msm_dp_display);
++	connector = msm_dp_display->panel->connector;
++	link_info = &msm_dp_display->panel->link_info;
++
++	ret = drm_edid_connector_add_modes(connector);
++
++	/*
++	 * TB710FU: the panel EDID only carries 594 MHz for 4K60.  On two lanes
++	 * that needs 594 MHz * 24 bpp = 14.26 Gbps, more than the 12.96 Gbps of
++	 * 2-lane HBR3, so the driver falls back to 6 bpc (this sink rejects it).
++	 * A CVT-RB timing at 535.68 MHz fits (12.86 Gbps) but is not in the
++	 * EDID; synthesize it when the link really has two lanes.
++	 *
++	 * Hide every timing that does not fit at 24 bpp instead of using a
++	 * 594 MHz constant: CEA also expands 4K60 as 59.94 Hz with a 593407 kHz
++	 * pixel clock, which stayed in the list and was what KWin actually
++	 * picked on an HBR2 link (bpp 18 -> black screen).
++	 *
++	 * Walk probed_modes, not modes: drm_edid_connector_add_modes() fills
++	 * connector->probed_modes and drm_connector_list_update() merges it
++	 * into connector->modes only after get_modes() returns.
++	 */
++	if (link_info->num_lanes == 2 && link_info->rate) {
++		u64 link_bw = (u64)link_info->rate * 2 * 8;
++
++		list_for_each_entry_safe(mode, tmp, &connector->probed_modes, head) {
++			if ((u64)mode->clock * 24 > link_bw) {
++				list_del(&mode->head);
++				drm_mode_destroy(connector->dev, mode);
++			}
++		}
+ 
+-	return drm_edid_connector_add_modes(msm_dp_display->panel->connector);
++		/*
++		 * 2-lane HBR2 cannot carry 4K60 at 8 bpc at all.  On HBR3,
++		 * make the synthesized CVT-RB mode the preferred one so KWin
++		 * picks it automatically instead of the unusable 594 MHz mode.
++		 */
++		if (link_info->rate >= 810000) {
++			list_for_each_entry(mode, &connector->probed_modes, head)
++				mode->type &= ~DRM_MODE_TYPE_PREFERRED;
++
++			mode = drm_mode_create(connector->dev);
++			if (mode) {
++				mode->clock = 535680;
++				mode->hdisplay = 3840;
++				mode->hsync_start = 3840 + 48;
++				mode->hsync_end = 3840 + 48 + 32;
++				mode->htotal = 4000;
++				mode->vdisplay = 2160;
++				mode->vsync_start = 2160 + 3;
++				mode->vsync_end = 2160 + 3 + 8;
++				mode->vtotal = 2232;
++				mode->flags = DRM_MODE_FLAG_PHSYNC |
++					      DRM_MODE_FLAG_NVSYNC;
++				mode->type = DRM_MODE_TYPE_DRIVER |
++					     DRM_MODE_TYPE_PREFERRED;
++				drm_mode_set_name(mode);
++				drm_mode_probed_add(connector, mode);
++			}
++		}
++
++		dev_info(msm_dp_display->drm_dev->dev,
++			 "TB710FU DP: 2 lanes, max rate=%u, CVT-RB 4K60 %s\n",
++			 link_info->rate,
++			 link_info->rate >= 810000 ? "added" : "skipped (needs HBR3)");
++	}
++
++	return ret;
+ }
+ 
+ bool msm_dp_display_check_video_test(struct msm_dp *dp)
+@@ -909,6 +1141,24 @@ enum drm_connector_status msm_dp_bridge_detect(struct drm_bridge *bridge,
+ 	priv = container_of(dp, struct msm_dp_display_private, msm_dp_display);
+ 
+ 	guard(mutex)(&priv->plugged_lock);
++
++	/*
++	 * TB710FU: the dock's ADSP replays the same alt-mode "connected"
++	 * notification every ~25 s, and each replay turns into a userspace
++	 * connector probe.  Reading the DPCD (caps, sink count) here is AUX
++	 * traffic to a sink that may be in standby; a monitor treats that as
++	 * activity, powers its scaler up, finds no video and shows its
++	 * "no signal / entering standby" OSD again.  Once the sink is known
++	 * to be plugged there is nothing to probe: report connected and touch
++	 * no AUX.  A real unplug either arrives as an OOB disconnected
++	 * notification (msm_dp_hpd_unplug_handle() clears ->plugged) or, if
++	 * that was missed, is caught as soon as ->plugged is false again.
++	 */
++	if (priv->plugged) {
++		DRM_DEBUG_DP("already plugged, report connected without AUX\n");
++		return connector_status_connected;
++	}
++
+ 	ret = pm_runtime_resume_and_get(&dp->pdev->dev);
+ 	if (ret) {
+ 		DRM_ERROR("failed to pm_runtime_resume\n");
+@@ -1289,6 +1539,34 @@ static int msm_dp_pm_runtime_suspend(struct device *dev)
+ 		msm_dp_display_host_phy_exit(dp);
+ 		msm_dp_aux_hpd_disable(dp->aux);
+ 	}
++
++	/*
++	 * TB710FU: do not carry keep_link's software state across a system
++	 * suspend.  keep_link (sink still attached when the stream stops)
++	 * leaves phy_initialized and link_clks_on set, but the QMP combo PHY
++	 * and the dispcc DP link clock are both powered down while the
++	 * system sleeps.  On resume msm_dp_display_host_phy_init() and
++	 * msm_dp_ctrl_link_clk_enable() therefore take their "already done"
++	 * early returns, and the first DPCD access - the AUX power-up in
++	 * msm_dp_link_psm_config() - is issued with a dead AUX PHY.  Its
++	 * completion never arrives, drm_dp_dpcd_access() burns 32 x 250 ms
++	 * per message, and the atomic commit thread stays wedged until the
++	 * PMIC watchdog resets the machine.
++	 *
++	 * Tear the link and the PHY down here, while both are still
++	 * accessible, so resume really runs phy_init() (which reprograms the
++	 * combo AUX block) and really enables the link clock.
++	 */
++	if (pm_suspend_target_state != PM_SUSPEND_ON &&
++	    !dp->msm_dp_display.is_edp && dp->phy_initialized) {
++		drm_dbg_dp(dp->drm_dev,
++			   "system suspend teardown: link_clks=%d power_on=%d\n",
++			   msm_dp_ctrl_link_clks_on(dp->ctrl),
++			   dp->msm_dp_display.power_on);
++		msm_dp_ctrl_off_link(dp->ctrl, dp->panel);
++		msm_dp_display_host_phy_exit(dp);
++	}
++
+ 	msm_dp_display_host_deinit(dp);
+ 
+ 	return 0;
+@@ -1569,8 +1847,22 @@ void msm_dp_bridge_hpd_notify(struct drm_bridge *bridge,
+ 			msm_dp_hpd_plug_handle(dp);
+ 		} else if (hpd_link_status == ISR_IRQ_HPD_PULSE_COUNT) {
+ 			msm_dp_irq_hpd_handle(dp);
+-		} else {
++		} else if (!dp->plugged) {
+ 			msm_dp_hpd_plug_handle(dp);
++		} else {
++			/*
++			 * TB710FU: the ADSP repeats the same "connected" OOB
++			 * notification every ~25 s while the dock stays attached.
++			 * Re-running the plug handler re-reads the EDID over AUX
++			 * and writes DPCD SET_POWER=D0, which wakes a monitor that
++			 * is in standby (tablet screen DPMS off) and makes it show
++			 * its "no signal / entering standby" OSD again and again.
++			 * A real replug always arrives as disconnected first, or as
++			 * REPLUG / IRQ_HPD above, so nothing is lost by ignoring the
++			 * repeated notification.
++			 */
++			drm_dbg_dp(dp->drm_dev,
++				   "already plugged, ignoring repeated HPD notify\n");
+ 		}
+ 	} else {
+ 		msm_dp_hpd_unplug_handle(dp);
+diff --git a/drivers/gpu/drm/msm/dp/dp_panel.c b/drivers/gpu/drm/msm/dp/dp_panel.c
+index e76dad0f6..eceb0ce12 100644
+--- a/drivers/gpu/drm/msm/dp/dp_panel.c
++++ b/drivers/gpu/drm/msm/dp/dp_panel.c
+@@ -4,6 +4,26 @@
+  */
+ 
+ #include "dp_panel.h"
++
++/*
++ * TB710FU: some docks advertise HBR2 in DPCD even though their receiver can
++ * train HBR3.  This opt-in parameter forces 2-lane links to 810000 so the
++ * CVT-RB 4K60 mode can be exposed.  Off by default; if link training fails,
++ * set it back to N and replug.
++ */
++static bool force_hbr3;
++module_param(force_hbr3, bool, 0644);
++MODULE_PARM_DESC(force_hbr3, "TB710FU: force 2-lane DP links to HBR3");
++
++/*
++ * Test-only counterpart: clamp a 2-lane link to HBR2 so the "dock fell back
++ * to HBR2" case can be validated without a 4-lane <-> 2-lane replug (that
++ * transition hard-resets this board at alt-mode re-entry).  Applies on the
++ * next HPD, i.e. a replug.
++ */
++static bool force_hbr2;
++module_param(force_hbr2, bool, 0644);
++MODULE_PARM_DESC(force_hbr2, "TB710FU: clamp 2-lane DP links to HBR2 (test)");
+ #include "dp_reg.h"
+ #include "dp_utils.h"
+ 
+@@ -92,6 +112,7 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 	struct msm_dp_link_info *link_info;
+ 	struct msm_dp_link *link;
+ 	u8 *dpcd, major, minor;
++	u32 tb_prev_rate;
+ 
+ 	panel = container_of(msm_dp_panel, struct msm_dp_panel_private, msm_dp_panel);
+ 	dpcd = msm_dp_panel->dpcd;
+@@ -101,6 +122,21 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 
+ 	msm_dp_panel->vsc_sdp_supported = drm_dp_vsc_sdp_supported(panel->aux, dpcd);
+ 	link_info = &msm_dp_panel->link_info;
++
++	/*
++	 * TB710FU: HPD is a new connection, so the sink's advertised link rate
++	 * must be re-read.  Upstream only assigns link_info->rate when it is 0
++	 * and never resets it; the local 4-lane -> HBR2 clamp writes 540000,
++	 * which then stuck for every later 2-lane dock until the module was
++	 * reloaded.  The dock advertises HBR3 (0x1e) at HPD and 2-lane HBR3 +
++	 * 535.68 MHz CVT-RB is the only 8 bpc 4K60 combination that fits.
++	 */
++	tb_prev_rate = link_info->rate;
++	link_info->rate = 0;
++	link_info->rate_set = 0;
++	link_info->use_rate_set = false;
++	memset(link_info->supported_rates, 0, sizeof(link_info->supported_rates));
++
+ 	link_info->revision = dpcd[DP_DPCD_REV];
+ 	major = (link_info->revision >> 4) & 0x0f;
+ 	minor = link_info->revision & 0x0f;
+@@ -197,6 +233,41 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 	if (max_lttpr_lanes && max_lttpr_lanes < link_info->num_lanes)
+ 		link_info->num_lanes = max_lttpr_lanes;
+ 
++	/*
++	 * TB710FU: 4-lane HBR3 (25.92 Gbps) is marginal on this board.  The
++	 * link trains, but the sink keeps losing the stream and re-requests
++	 * link status every ~28 s (A27U direct: "No Signal" every 30 s).
++	 * Capping 4-lane links at HBR2 keeps it stable and still carries
++	 * 4K60 8bpc (17.28 > 14.26 Gbps); 2-lane docks keep HBR3, which they
++	 * need for 4K60 8bpc (12.96 > 12.86 Gbps).
++	 */
++	if (link_info->num_lanes >= 4 && link_info->rate > 540000) {
++		link_info->rate = 540000;
++		link_info->use_rate_set = false;
++		link_info->rate_set = 0;
++	}
++
++	if (link_info->num_lanes == 2 && force_hbr3 && link_info->rate < 810000) {
++		u32 sink_rate = link_info->rate;
++
++		link_info->rate = 810000;
++		link_info->use_rate_set = false;
++		link_info->rate_set = 0;
++		/* panel->drm_dev can be NULL in the pmic_glink altmode worker. */
++		pr_info("TB710FU DP: forcing 2-lane HBR3 (sink advertised %u)\n",
++			sink_rate);
++	}
++
++	if (link_info->num_lanes == 2 && force_hbr2 && link_info->rate > 540000) {
++		u32 sink_rate = link_info->rate;
++
++		link_info->rate = 540000;
++		link_info->use_rate_set = false;
++		link_info->rate_set = 0;
++		pr_info("TB710FU DP: clamping 2-lane link to HBR2 (sink advertised %u)\n",
++			sink_rate);
++	}
++
+ 	drm_dbg_dp(panel->drm_dev, "version: %d.%d\n", major, minor);
+ 	drm_dbg_dp(panel->drm_dev, "link_rate=%d\n", link_info->rate);
+ 	drm_dbg_dp(panel->drm_dev, "link_rate_set=%d\n", link_info->rate_set);
+@@ -206,6 +277,10 @@ static int msm_dp_panel_read_dpcd(struct msm_dp_panel *msm_dp_panel)
+ 	if (drm_dp_enhanced_frame_cap(dpcd))
+ 		link_info->capabilities |= DP_LINK_CAP_ENHANCED_FRAMING;
+ 
++	if (tb_prev_rate != link_info->rate)
++		pr_info("TB710FU DP: link rate re-read on HPD: %u -> %u (lanes=%u)\n",
++			tb_prev_rate, link_info->rate, link_info->num_lanes);
++
+ 	msm_dp_panel_read_psr_cap(panel);
+ 
+ 	return rc;

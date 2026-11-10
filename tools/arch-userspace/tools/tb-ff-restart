@@ -1,0 +1,19 @@
+#!/bin/sh
+# tb-ff-restart — recover a hung flatpak Firefox.
+# SIGKILLs the whole flatpak app, then relaunches it detached in the user
+# systemd manager so it survives ssh/logout (a plain `flatpak run` from an
+# ssh session gets reaped with the session's systemd scope).
+set -u
+UID_=$(id -u)
+RT=/run/user/$UID_
+export XDG_RUNTIME_DIR=$RT
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$RT/bus
+export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1}
+
+pkill -9 -f '/app/lib/firefox/' 2>/dev/null
+pkill -9 -f 'crashhelper' 2>/dev/null
+sleep 1
+
+exec systemd-run --user --collect --unit="firefox-$(date +%H%M%S)" \
+  --setenv=WAYLAND_DISPLAY="$WAYLAND_DISPLAY" \
+  /usr/bin/flatpak run org.mozilla.firefox

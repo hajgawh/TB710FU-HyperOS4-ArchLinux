@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=重启到澎湃OS4
+Name[en]=Reboot to HyperOS
+GenericName=双系统切换
+Comment=写入 HyperOS 默认 kShimC 引导镜像并重启（回读校验后才重启）
+Exec=sudo /usr/local/bin/switch2os4
+Icon=system-reboot
+Terminal=true
+Categories=System;

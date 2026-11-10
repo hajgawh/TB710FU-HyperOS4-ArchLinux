@@ -1,0 +1,48 @@
+# TB710FU OS4 冻结清单 v1.0
+#
+# 规则：
+#   - 只处理本文件列出的包，其他包一律不碰。
+#   - 每行一个包名，支持 # 注释与空行。
+#   - 顺序有意义：keeper/常驻拉起者放在被拉起者之前。
+#   - 恢复：模块 action 按钮 / bin/restore.sh；卸载模块自动恢复。
+#
+# 实测依据（2026-11-07，OS4.0.11，adb dumpsys meminfo）：
+#   总 PSS 3.23 GB，本清单覆盖约 1.27 GB PSS。
+
+# --- A. 小爱 / AI 认知（约 780 MB PSS）---
+com.miui.voiceassist
+com.miui.voiceassistProxy
+com.miui.voicetrigger
+com.xiaomi.aicr
+com.xiaomi.aiasst.vision
+com.miui.audiomonitor
+com.miui.contentcatcher
+com.xiaomi.mibrain.speech
+
+# --- B. 账号 / 云 / 互联（约 212 MB PSS）---
+com.miui.cloudservice
+com.miui.cloudbackup
+com.miui.micloudsync
+com.xiaomi.finddevice
+com.miui.mishare.connectivity
+com.xiaomi.mi_connect_service
+com.milink.service
+com.xiaomi.mirror
+com.xiaomi.continuity.sdkapp
+com.miui.vsimcore
+
+# --- C. 负一屏 / 推送 / 快应用（约 230 MB PSS）---
+com.miui.personalassistant
+com.xiaomi.xmsfkeeper
+com.xiaomi.xmsf
+com.miui.hybrid
+com.xiaomi.minigame
+com.xiaomi.gamecenter.sdk.service
+
+# --- D. 广告 / 统计 / 诊断（约 50 MB PSS）---
+com.miui.analytics
+com.miui.systemAdSolution
+com.xiaomi.ab
+com.miui.misightservice
+com.miui.bugreport
+com.miui.powerinsight

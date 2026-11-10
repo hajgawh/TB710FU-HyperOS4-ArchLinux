@@ -1,0 +1,16 @@
+# Intentionally empty.
+#
+# The TB710FU product build.prop now bakes every persistent switch this module
+# used to force:
+#   persist.sys.gesture_wakeup=2
+#   persist.sys.device_case_enabled=1
+#   persist.sys.high_touch_sampling_rate.enable=1
+#   persist.sys.stylus.enable=1
+#   persist.miui.extm.enable=1
+#   ro.product.marketname=联想小新平板Pro GT
+#
+# A KSU system.prop is applied with resetprop on every boot, which would
+# overwrite the user's Settings choice (e.g. turning double-tap wake off would
+# not survive a reboot).  The build.prop values are only first-boot defaults;
+# persistent_properties in /data then owns them.  Keep this file comment-only so
+# an in-place module upgrade also replaces the old prop file.

@@ -1,0 +1,268 @@
+From f8f4564835ec60fea5df518a88825f6d34460512 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:04:27 +0000
+Subject: [PATCH 17/27] tb710fu: touch FW health work, panel regulator
+ NULL-safe
+
+---
+ .../panel/panel-nt36532-wqhd-dual-dsi-dsc.c   |   8 +-
+ .../input/touchscreen/NT36XXX_SPI/nt36xxx.c   | 164 ++++++++++++++----
+ 2 files changed, 140 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+index 2383ffa89..ab402d673 100644
+--- a/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
++++ b/drivers/gpu/drm/panel/panel-nt36532-wqhd-dual-dsi-dsc.c
+@@ -316,6 +316,11 @@ static int nt36532_prepare(struct drm_panel *panel)
+ 	return 0;
+ }
+ 
++static int nt36532_enable(struct drm_panel *panel)
++{
++	return 0;
++}
++
+ static int nt36532_disable(struct drm_panel *panel)
+ {
+ 	struct panel_info *pinfo = to_panel_info(panel);
+@@ -326,7 +331,7 @@ static int nt36532_disable(struct drm_panel *panel)
+ 
+ 	mipi_dsi_dcs_enter_sleep_mode_multi(&dsi_ctx);
+ 	msleep(120);
+-	
++
+ 	return dsi_ctx.accum_err;
+ }
+ 
+@@ -387,6 +392,7 @@ static enum drm_panel_orientation nt36532_get_orientation(struct drm_panel *pane
+ }
+ 
+ static const struct drm_panel_funcs nt36532_panel_funcs = {
++	.enable = nt36532_enable,
+ 	.disable = nt36532_disable,
+ 	.prepare = nt36532_prepare,
+ 	.unprepare = nt36532_unprepare,
+diff --git a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+index 27d34086a..4ba1c1ecc 100644
+--- a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
++++ b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+@@ -254,9 +254,21 @@ static void nvt_irq_enable(bool enable)
+  * dead for the whole session.  The vendor ESD watchdog keys off irq idle
+  * time, which would re-flash forever on an idle screen - poll the FW
+  * handshake instead and re-flash only when it stops answering. */
++/* TB710FU: the IRQ path is the only reliable "the touch engine died"
++ * signal - after a resume the FWINFO block still answers while the
++ * point-data engine returns 0xFD, so probing FWINFO says "alive" and
++ * re-enables the IRQ into a dead chip.  Trust the IRQ path instead. */
++static bool tb_fw_dead;
+ static void nvt_fw_health_work(struct work_struct *work);
+ static DECLARE_DELAYED_WORK(nvt_fw_health_dwork, nvt_fw_health_work);
+ 
++/* TB710FU v7: bound the re-flash loop.  Every 245 KB download is risky
++ * while the display is live (the third one has wedged the SoC), so after
++ * this many consecutive attempts keep the IRQ masked and stop touching
++ * the SPI bus.  A valid point frame or a panel cycle re-arms recovery. */
++#define TB_REFLASH_MAX_FAILS 2
++static int tb_reflash_fails;
++
+ /* TB710FU: the generic handshake-byte probe (0xA0 pattern) never matches
+  * this panel's FW - it keeps EVENT_MAP_HANDSHAKING at 0x00 even while fully
+  * alive, so the poll re-flashed every ~5.9 s and touch hitched each time.
+@@ -276,7 +288,12 @@ static int nvt_fw_alive_probe(void)
+ 		buf[1] = 0;
+ 		buf[2] = 0;
+ 		CTP_SPI_READ(ts->client, buf, 3);
+-		if ((uint8_t)(buf[1] + buf[2]) == 0xFF && buf[1] != 0)
++		/* TB710FU: while the die is held in reset it answers 0xFD
++		 * (or all-zero) on the FWINFO block; the old check treated
++		 * 0xFD as "alive" whenever the sum happened to be 0xFF and
++		 * then re-enabled the IRQ into a dead chip.  Reject both. */
++		if ((uint8_t)(buf[1] + buf[2]) == 0xFF && buf[1] != 0 &&
++		    buf[1] != 0xFD && buf[2] != 0xFD)
+ 			return 0;
+ 		usleep_range(50000, 50000);
+ 	}
+@@ -321,16 +338,89 @@ static bool tb710fu_panel_is_on(void)
+ 
+ static void nvt_fw_health_work(struct work_struct *work)
+ {
+-	if (!tb710fu_panel_is_on())
++	int32_t ret;
++
++	if (!tb710fu_panel_is_on()) {
++		/* The panel is off (or suspended); the combo die is unpowered,
++		 * so nothing can be recovered now.  A later panel cycle will
++		 * re-arm the bounded retry budget. */
++		tb_reflash_fails = 0;
+ 		goto out;
++	}
+ 
+-	if (nvt_fw_alive_probe()) {
++	if (!READ_ONCE(tb_fw_dead) && !nvt_fw_alive_probe()) {
++		/* FW answered and the IRQ path has not flagged a WDT reset:
++		 * re-enable the IRQ in case it was masked earlier. */
++		if (!ts->irq_enabled) {
++			NVT_ERR("fw health: FW alive again, irq re-enabled\n");
++			nvt_irq_enable(true);
++		}
++		goto out;
++	}
++
++	if (tb_reflash_fails >= TB_REFLASH_MAX_FAILS) {
++		if (tb_reflash_fails == TB_REFLASH_MAX_FAILS) {
++			NVT_ERR("fw health: %d consecutive re-flash attempts, IRQ stays masked until the panel cycles\n",
++				tb_reflash_fails);
++			tb_reflash_fails++;
++		}
++		goto out;
++	}
++
++	if (READ_ONCE(tb_fw_dead))
++		NVT_ERR("fw health: re-flashing after WDT reset\n");
++	else
+ 		NVT_ERR("fw health: touch FW dead, re-flashing\n");
+-		mutex_lock(&ts->lock);
+-		nvt_update_firmware(BOOT_UPDATE_FIRMWARE_NAME);
+-		mutex_unlock(&ts->lock);
+-		nvt_irq_enable(true);
++
++	tb_reflash_fails++;
++
++	/* TB710FU v7b: keep the IRQ masked for the whole download, and give
++	 * the combo die a real RESX pulse first.  After system suspend the
++	 * panel rails were cut, so the touch half powers up cold; the HW-CRC
++	 * download path only issues nvt_bootloader_reset() and never drives
++	 * TP_RESX, unlike nvt_download_firmware() (nt36xxx_fw_update.c), and
++	 * the downloaded FW then answers FWINFO/REK while the point engine
++	 * keeps returning 0xFD.  Mirror the vendor cold sequence here. */
++	nvt_irq_enable(false);
++	mutex_lock(&ts->lock);
++	if (ts->reset_desc) {
++		gpiod_set_value_cansleep(ts->reset_desc, 0);
++		msleep(1);
++	}
++	nvt_eng_reset();
++	if (ts->reset_desc) {
++		gpiod_set_value_cansleep(ts->reset_desc, 1);
++		msleep(10);
++	}
++	ret = nvt_update_firmware(BOOT_UPDATE_FIRMWARE_NAME);
++	/*
++	 * The download only waits for RESET_STATE_INIT (0xA0).  The vendor
++	 * resume path waited for RESET_STATE_REK (0xA1) after the transfer
++	 * (nt36xxx.c: the commented block in nvt_ts_resume).  Wait for it
++	 * before anyone reads point data again.
++	 */
++	if (!ret)
++		ret = nvt_check_fw_reset_state(RESET_STATE_REK);
++	mutex_unlock(&ts->lock);
++
++	if (ret) {
++		NVT_ERR("fw health: re-flash/REK failed (%d), attempt %d, irq stays masked\n",
++			ret, tb_reflash_fails);
++		goto out;
+ 	}
++
++	/* Quiet window: the FW has just left reset and the combo die is
++	 * still settling.  Only then hand the IRQ back. */
++	msleep(300);
++	WRITE_ONCE(tb_fw_dead, false);
++	NVT_ERR("fw health: re-flash ok (REK), irq back\n");
++	nvt_irq_enable(true);
++	/* TB710FU: intentionally no edge/game/pen/haptics replay here.
++	 * Right after a resume-time re-flash those commands fail
++	 * (0xBA/0x7F/0x79/0x7B) and take the FW down again, which turns
++	 * into a re-flash loop that eventually wedges the SoC inside
++	 * the 245 KB download.  The cached state is re-applied at the
++	 * next boot/probe instead. */
+ out:
+ 	queue_delayed_work(system_wq, &nvt_fw_health_dwork,
+ 			   msecs_to_jiffies(5000));
+@@ -1932,16 +2022,35 @@ static irqreturn_t nvt_ts_work_func(int irq, void *data)
+ */
+ 
+ #if NVT_TOUCH_WDT_RECOVERY
++	/* TB710FU v7b: only a real point frame proves the engine is back.
++	 * A successful download/REK does not (FWINFO keeps answering while
++	 * point data is 0xFD), so reset the bounded re-flash budget here. */
++	if (point_data[1] != 0xFD && point_data[1] != 0xFE)
++		tb_reflash_fails = 0;
+ 	/* ESD protect by WDT */
+ 	if (nvt_wdt_fw_recovery(point_data)) {
+-		NVT_ERR("Recover for fw reset, %02X\n", point_data[1]);
++		NVT_ERR("Recover for fw reset, %02X (deferred to health work)\n",
++			point_data[1]);
+ 		if (point_data[1] == 0xFE) {
+ 			nvt_sw_reset_idle();
+ 			nvt_clear_aci_error_flag();
+ 		}
+-		nvt_read_fw_history_all();
+-		nvt_update_firmware(BOOT_UPDATE_FIRMWARE_NAME);
+-		nvt_read_fw_history_all();
++		/* TB710FU: never re-flash the 245 KB image from the IRQ
++		 * thread.  Right after resume the panel's RESX resets the
++		 * NT36532 combo die, so the first frames read 0xFD; the old
++		 * inline download wedged the whole SoC a few seconds later
++		 * and the PMIC watchdog reset the machine.
++		 *
++		 * The dead die also keeps its interrupt line asserted, so
++		 * simply returning re-enters this handler every ~15 ms and
++		 * the resulting SPI+printk storm wedges the box even faster.
++		 * Mask the IRQ (nosync: we are inside the handler) and let
++		 * the health work re-flash from system_wq, then re-enable. */
++		WRITE_ONCE(tb_fw_dead, true);
++		disable_irq_nosync(ts->client->irq);
++		ts->irq_enabled = false;
++		mod_delayed_work(system_wq, &nvt_fw_health_dwork,
++				 msecs_to_jiffies(500));
+ #if NVT_CUST_PROC_CMD
+ 		wdt_recovery = true;
+ #endif
+@@ -2282,24 +2391,14 @@ XFER_ERROR:
+ 
+ #if NVT_CUST_PROC_CMD
+ 	if (wdt_recovery && bTouchIsAwake) {
+-#if NVT_EDGE_REJECT
+-		nvt_edge_reject_set(ts->edge_reject_state);
+-#endif
+-#if NVT_EDGE_GRID_ZONE
+-		nvt_edge_grid_zone_set(ts->edge_grid_zone_info.degree,
+-				       ts->edge_grid_zone_info.direction,
+-				       ts->edge_grid_zone_info.y1,
+-				       ts->edge_grid_zone_info.y2);
+-#endif
+-#if NVT_PALM_MODE
+-		nvt_game_mode_set(ts->game_mode_state);
+-#endif
+-#if NVT_SUPPORT_PEN
+-		nvt_support_pen_set(ts->pen_state);
+-#endif
+-#ifdef BUILD_LAPIS_TOUCH
+-        nvt_haptics_set(ts->haptics_state);
+-#endif
++		/* TB710FU: do NOT replay the edge/game/pen/haptics commands
++		 * from here.  This runs right after an FW reset, i.e. while
++		 * the die is still dead (or being re-flashed by the health
++		 * work), and the burst of failing SPI transfers that follows
++		 * has been observed to wedge the whole SoC ~9 s later.
++		 * The health work replays the cached state once the FW answers
++		 * again (nvt_fw_health_work -> nvt_restore_cmd_func). */
++		NVT_ERR("wdt recovery: cmd restore deferred to health work\n");
+ 	}
+ #endif
+ 	return IRQ_HANDLED;
+@@ -3992,9 +4091,12 @@ static int nvt_ts_pm_resume(struct device *dev)
+ {
+ 	ts->dev_pm_suspend = false;
+ 	complete(&ts->dev_pm_resume_completion);
+-	/* Bus and panel are back; re-check the touch die shortly. */
++	/* Bus and panel are back; re-check the touch die shortly.
++	 * TB710FU: 3 s, not 1 s - KWin re-enables the panel right after
++	 * resume and the DSI RESX resets the NT36532 combo die, so a probe
++	 * that lands inside that window only sees 0xFD garbage. */
+ 	queue_delayed_work(system_wq, &nvt_fw_health_dwork,
+-			   msecs_to_jiffies(1000));
++			   msecs_to_jiffies(3000));
+ #ifdef BUILD_LAPIS_TOUCH
+ #if NVT_HALL_CHECK
+ 	printk("%s:++\n", __func__);

@@ -1,0 +1,18 @@
+#!/bin/bash
+# TB710FU: WirePlumber may enumerate the sound card before the DP link is up,
+# so the pro-audio profile only creates pro-output-0. Once the link settles,
+# restart PipeWire once if the DP node is still missing.
+dp=""
+for c in /sys/class/drm/card*-DP-*; do
+  [ "$(cat "$c/status" 2>/dev/null)" = "connected" ] && dp=1
+done
+[ -n "$dp" ] || exit 0
+sleep 12
+if pw-dump 2>/dev/null | grep -q "pro-output-1"; then
+  echo "tb-dp-sink-ensure: pro-output-1 present"
+  exit 0
+fi
+if [ "$(cat /sys/class/drm/card*-DP-*/status 2>/dev/null | head -1)" = "connected" ]; then
+  systemctl --user restart pipewire.service
+  echo "tb-dp-sink-ensure: restarted pipewire to expose pro-output-1"
+fi

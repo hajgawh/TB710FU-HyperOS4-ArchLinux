@@ -1,0 +1,11 @@
+[Unit]
+Description=TB710FU DP/HDMI audio route (MultiMedia2)
+After=sound.target multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tb-dp-audio
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

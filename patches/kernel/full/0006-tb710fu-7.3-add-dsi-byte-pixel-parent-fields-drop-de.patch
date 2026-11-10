@@ -1,0 +1,142 @@
+From 8aaa99fa0dbff49099577c0a029e0fb23c0507ac Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Tue, 27 Oct 2026 04:27:39 +0000
+Subject: [PATCH 06/27] tb710fu 7.3: add dsi byte/pixel parent fields; drop
+ dead QDSS tables
+
+---
+ drivers/gpu/drm/msm/dsi/dsi_host.c    |   2 +
+ drivers/net/wireless/ath/ath12k/qmi.c | 107 --------------------------
+ 2 files changed, 2 insertions(+), 107 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 691d108f3..441d500a1 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -128,6 +128,8 @@ struct msm_dsi_host {
+ 	struct clk *pixel_src_clk;
+ 	struct clk *dsi_pll_byte_clk;
+ 	struct clk *dsi_pll_pixel_clk;
++	struct clk *byte_src_parent;
++	struct clk *pixel_src_parent;
+ 
+ 	unsigned long byte_clk_rate;
+ 	bool byte_intf_clk_div_2;
+diff --git a/drivers/net/wireless/ath/ath12k/qmi.c b/drivers/net/wireless/ath/ath12k/qmi.c
+index a708898de..3f7c8d79f 100644
+--- a/drivers/net/wireless/ath/ath12k/qmi.c
++++ b/drivers/net/wireless/ath/ath12k/qmi.c
+@@ -1619,113 +1619,6 @@ static const struct qmi_elem_info qmi_wlanfw_bdf_download_resp_msg_v01_ei[] = {
+ 	},
+ };
+ 
+-static const struct qmi_elem_info qmi_wlanfw_qdss_download_req_msg_v01_ei[] = {
+-	{
+-		.data_type	= QMI_OPT_FLAG,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x10,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   total_size_valid),
+-	},
+-	{
+-		.data_type	= QMI_UNSIGNED_4_BYTE,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u32),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x10,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   total_size),
+-	},
+-	{
+-		.data_type	= QMI_OPT_FLAG,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x11,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   seg_id_valid),
+-	},
+-	{
+-		.data_type	= QMI_UNSIGNED_4_BYTE,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u32),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x11,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   seg_id),
+-	},
+-	{
+-		.data_type	= QMI_OPT_FLAG,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x12,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   data_valid),
+-	},
+-	{
+-		.data_type	= QMI_DATA_LEN,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u16),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x12,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   data_len),
+-	},
+-	{
+-		.data_type	= QMI_UNSIGNED_1_BYTE,
+-		.elem_len	= QMI_WLANFW_MAX_DATA_SIZE_V01,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= VAR_LEN_ARRAY,
+-		.tlv_type	= 0x12,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   data),
+-	},
+-	{
+-		.data_type	= QMI_OPT_FLAG,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x13,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   end_valid),
+-	},
+-	{
+-		.data_type	= QMI_UNSIGNED_1_BYTE,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(u8),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x13,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_req_msg_v01,
+-					   end),
+-	},
+-	{
+-		.data_type	= QMI_EOTI,
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= QMI_COMMON_TLV_TYPE,
+-	},
+-};
+-
+-static const struct qmi_elem_info qmi_wlanfw_qdss_download_resp_msg_v01_ei[] = {
+-	{
+-		.data_type	= QMI_STRUCT,
+-		.elem_len	= 1,
+-		.elem_size	= sizeof(struct qmi_response_type_v01),
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= 0x02,
+-		.offset		= offsetof(struct qmi_wlanfw_qdss_download_resp_msg_v01,
+-					   resp),
+-		.ei_array	= qmi_response_type_v01_ei,
+-	},
+-	{
+-		.data_type	= QMI_EOTI,
+-		.array_type	= NO_ARRAY,
+-		.tlv_type	= QMI_COMMON_TLV_TYPE,
+-	},
+-};
+-
+ static const struct qmi_elem_info qmi_wlanfw_m3_info_req_msg_v01_ei[] = {
+ 	{
+ 		.data_type	= QMI_UNSIGNED_8_BYTE,

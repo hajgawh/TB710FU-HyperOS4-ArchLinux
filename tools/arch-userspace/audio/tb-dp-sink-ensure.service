@@ -1,0 +1,10 @@
+[Unit]
+Description=TB710FU ensure HDMI/DP sink after DP link-up
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tb-dp-sink-ensure
+
+[Install]
+WantedBy=default.target

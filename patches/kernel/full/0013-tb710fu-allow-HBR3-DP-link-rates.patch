@@ -1,0 +1,32 @@
+From 415a747201db40abcdb0e519692eb063ac893495 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Tue, 3 Nov 2026 05:12:03 +0000
+Subject: [PATCH 13/27] tb710fu: allow HBR3 DP link rates
+
+msm_dp_link_link_frequencies() defaults max_dp_link_rate to HBR2 when the
+port@1 endpoint has no link-frequencies property.  Neither sm8650.dtsi nor
+any SM8650 board declares it, so mainline DP was locked to 5.4 Gbps and the
+USB-C dock could not reach 4K60.
+
+Declare 1.62/2.7/5.4/8.1 Gbps on mdss_dp0_out.  With the 2-lane DP + USB3
+pin assignment this trains HBR3 and 4K60 8bpc works with the 535.68 MHz
+CVT-RB mode (12.86 Gbps < 12.96 Gbps effective).
+---
+ arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+index 115cc4d37..332ccb4fa 100644
+--- a/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
++++ b/arch/arm64/boot/dts/qcom/sm8650-lenovo-tb710fu.dts
+@@ -816,6 +816,10 @@
+ 	status = "okay";
+ };
+ 
++&mdss_dp0_out {
++	link-frequencies = /bits/ 64 <1620000000 2700000000 5400000000 8100000000>;
++};
++
+ &spi4 {
+ 	status = "okay";
+ 

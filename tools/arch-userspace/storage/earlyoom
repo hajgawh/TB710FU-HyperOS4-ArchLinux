@@ -1,0 +1,3 @@
+# TB710FU: real earlyoom (no --dryrun). SIGTERM at mem<=8% && swap<=5%,
+# SIGKILL at 4% / 2.5%. Kept as the only OOM daemon; systemd-oomd stays off.
+EARLYOOM_ARGS="-r 60 -m 8 -s 5 --avoid (^|/)(init|systemd|Xorg|sshd)$"

@@ -1,0 +1,97 @@
+#!/bin/sh
+# Print battery + thermal-guard state as one JSON object for the Plasma applet.
+# The Plasma5Support "executable" engine puts all stdout in data.stdout,
+# so this script must print exactly one valid JSON object and nothing else.
+BATT=/sys/class/power_supply/battery
+STATE=/run/tb-thermal-guard.state
+CONF=/etc/tb710fu/thermal-guard.conf
+
+t=$(cat "$BATT/temp" 2>/dev/null || true)
+case $t in
+    ''|*[!0-9-]*) t=0 ;;
+esac
+temp_raw=$t
+sign=""
+if [ "$t" -lt 0 ]; then
+    sign="-"
+    t=$((-t))
+fi
+whole=$((t / 10))
+frac=$((t % 10))
+status=$(cat "$BATT/status" 2>/dev/null || echo unknown)
+capacity=$(cat "$BATT/capacity" 2>/dev/null || echo 0)
+case $capacity in
+    ''|*[!0-9]*) capacity=0 ;;
+esac
+
+t1=38000
+t2=39000
+t3=40000
+if [ -r "$CONF" ]; then
+    v=$(grep -m1 '^BATT_T1=' "$CONF" 2>/dev/null | cut -d= -f2-)
+    case $v in ''|*[!0-9]*) ;; *) t1=$v ;; esac
+    v=$(grep -m1 '^BATT_T2=' "$CONF" 2>/dev/null | cut -d= -f2-)
+    case $v in ''|*[!0-9]*) ;; *) t2=$v ;; esac
+    v=$(grep -m1 '^BATT_T3=' "$CONF" 2>/dev/null | cut -d= -f2-)
+    case $v in ''|*[!0-9]*) ;; *) t3=$v ;; esac
+fi
+
+guard=absent
+tier=-1
+cap0=0
+cap1=0
+cap3=0
+cap5=0
+if [ -r "$STATE" ]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$STATE" 2>/dev/null || echo 0) ))
+    if [ "$age" -le 5 ]; then
+        guard=active
+    else
+        guard=stale
+    fi
+    v=$(grep -m1 '^batt_tier=' "$STATE" 2>/dev/null | cut -d= -f2-)
+    case $v in ''|*[!0-9-]*) ;; *) tier=$v ;; esac
+    for name in cap0 cap1 cap3 cap5; do
+        v=$(grep -m1 "^${name}=" "$STATE" 2>/dev/null | cut -d= -f2-)
+        case $v in ''|*[!0-9]*) continue ;; esac
+        case $name in
+            cap0) cap0=$v ;;
+            cap1) cap1=$v ;;
+            cap3) cap3=$v ;;
+            cap5) cap5=$v ;;
+        esac
+    done
+fi
+
+# A stale/absent guard must not leave the bar stuck on its last colour.
+if [ "$guard" != "active" ]; then
+    tier=-1
+    cap0=0
+    cap1=0
+    cap3=0
+    cap5=0
+fi
+
+# CPU core sensors: cpu0/cpu1/cpu2-*/cpu3-*/.../cpu7-*; exclude cpuss*.
+cpu_max=0
+cpu_zone=""
+for z in /sys/class/thermal/thermal_zone*; do
+    zt=$(cat "$z/type" 2>/dev/null) || continue
+    case $zt in
+        cpu[0-9]*-thermal) ;;
+        *) continue ;;
+    esac
+    zv=$(cat "$z/temp" 2>/dev/null) || continue
+    case $zv in ''|*[!0-9-]*) continue ;; esac
+    if [ "$zv" -gt "$cpu_max" ]; then
+        cpu_max=$zv
+        cpu_zone=$zt
+    fi
+done
+cpu_whole=$((cpu_max / 1000))
+cpu_frac=$(((cpu_max % 1000) / 100))
+
+printf '{"temp":%s,"temp_c":%s%s.%s,"status":"%s","capacity":%s,"t1":%s,"t2":%s,"t3":%s,"tier":%s,"guard":"%s","cap0":%s,"cap1":%s,"cap3":%s,"cap5":%s,"cpu_max":%s,"cpu_max_c":%s.%s,"cpu_zone":"%s"}\n' \
+    "$temp_raw" "$sign" "$whole" "$frac" "$status" "$capacity" "$t1" "$t2" "$t3" "$tier" "$guard" \
+    "$cap0" "$cap1" "$cap3" "$cap5" \
+    "$cpu_max" "$cpu_whole" "$cpu_frac" "$cpu_zone"

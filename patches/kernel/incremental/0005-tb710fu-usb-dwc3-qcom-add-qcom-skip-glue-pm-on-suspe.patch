@@ -1,0 +1,56 @@
+From 2d064e8497f4aa760143ada20f124111fa533e4d Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 05:56:02 +0000
+Subject: [PATCH 5/8] tb710fu: usb: dwc3: qcom: add
+ qcom,skip-glue-pm-on-suspend quirk
+
+Allow a board to keep the dwc3 glue clocks and interconnect alive across system suspend. Needed by TB710FU so a dock hub survives s2idle.
+---
+ drivers/usb/dwc3/dwc3-qcom.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/drivers/usb/dwc3/dwc3-qcom.c b/drivers/usb/dwc3/dwc3-qcom.c
+index 340d01c24..28eb9927e 100644
+--- a/drivers/usb/dwc3/dwc3-qcom.c
++++ b/drivers/usb/dwc3/dwc3-qcom.c
+@@ -84,6 +84,7 @@ struct dwc3_qcom {
+ 	struct icc_path		*icc_path_ddr;
+ 	struct icc_path		*icc_path_apps;
+ 	bool			has_eusb2_phy;
++	bool			skip_glue_pm;
+ };
+ 
+ #define to_dwc3_qcom(d) container_of((d), struct dwc3_qcom, dwc)
+@@ -730,6 +731,8 @@ static int dwc3_qcom_probe(struct platform_device *pdev)
+ 
+ 	wakeup_source = of_property_read_bool(dev->of_node, "wakeup-source");
+ 	device_init_wakeup(&pdev->dev, wakeup_source);
++	qcom->skip_glue_pm = device_property_read_bool(dev,
++			"qcom,skip-glue-pm-on-suspend");
+ 
+ 	qcom->is_suspended = false;
+ 
+@@ -765,6 +768,11 @@ static int dwc3_qcom_pm_suspend(struct device *dev)
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
++	if (qcom->skip_glue_pm) {
++		dev_info(dev, "skip dwc3 glue system suspend (DT quirk)\n");
++		return 0;
++	}
++
+ 	ret = dwc3_pm_suspend(&qcom->dwc);
+ 	if (ret)
+ 		return ret;
+@@ -785,6 +793,11 @@ static int dwc3_qcom_pm_resume(struct device *dev)
+ 	bool wakeup = device_may_wakeup(dev);
+ 	int ret;
+ 
++	if (qcom->skip_glue_pm) {
++		dev_info(dev, "skip dwc3 glue system resume (DT quirk)\n");
++		return 0;
++	}
++
+ 	ret = dwc3_qcom_resume(qcom, wakeup);
+ 	if (ret)
+ 		return ret;

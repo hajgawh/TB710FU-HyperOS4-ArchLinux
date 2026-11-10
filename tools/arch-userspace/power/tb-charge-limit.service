@@ -1,0 +1,13 @@
+[Unit]
+Description=TB710FU re-apply battery charge limit after boot
+After=multi-user.target tb-thermal-guard.service
+Wants=tb-thermal-guard.service
+
+[Service]
+Type=oneshot
+ExecStartPre=-/bin/sleep 20
+ExecStart=/usr/local/sbin/tb-charge-limit
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+id=tb_dp_widebus_off
+name=TB710FU DP widebus 关闭（A27U）
+version=v1.3
+versionCode=4
+author=zcode
+description=外接 Redmi A27U 时只写 vendor sde_dp 的 widebus=N，避免 HBR3 下黑屏；不做任何 HPD cycle/altmode 操作（hpd debugfs 会让 WCD939x 停在 USB 模式，导致无信号/USB 丢失）。日志 /data/local/tmp/tb-dp-widebus.log

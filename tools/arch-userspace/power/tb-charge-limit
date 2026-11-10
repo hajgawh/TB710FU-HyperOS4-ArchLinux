@@ -1,0 +1,4 @@
+#!/bin/sh
+case "$1" in
+  post) /usr/local/sbin/tb-charge-limit >/dev/null 2>&1 & ;;
+esac

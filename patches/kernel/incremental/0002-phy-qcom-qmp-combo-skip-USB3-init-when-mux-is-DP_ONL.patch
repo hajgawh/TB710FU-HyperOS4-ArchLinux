@@ -1,0 +1,49 @@
+From 6dd318f148b1535566d156259d882c537f463f65 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Sat, 7 Nov 2026 04:44:11 +0000
+Subject: [PATCH 2/8] phy: qcom-qmp-combo: skip USB3 init when mux is DP_ONLY
+
+---
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index 3333692fb..c4df58a46 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -4359,6 +4359,21 @@ static int qmp_combo_usb_init(struct phy *phy)
+ 	qmp_combo_tb_wait_usb3(qmp);
+ 
+ 	mutex_lock(&qmp->phy_mutex);
++
++	/*
++	 * TB710FU: if the mux is still routed to DP, do not initialize the
++	 * USB3 PCS.  dwc3_qcom_pm_resume() calls phy_init() while a DP-only
++	 * dock is attached; the PCS never becomes ready and -ETIMEDOUT aborts
++	 * the whole dwc3 resume, which also drops the USB2 hub.  Skipping
++	 * keeps the HS path alive; a later mux switch to USB3 powers the
++	 * USB3 PHY up through qmp_combo_apply_mode().
++	 */
++	if (READ_ONCE(qmp->qmpphy_mode) == QMPPHY_MODE_DP_ONLY) {
++		dev_info(qmp->dev, "TB710FU qmp: USB3 init skipped (DP_ONLY)\n");
++		mutex_unlock(&qmp->phy_mutex);
++		return 0;
++	}
++
+ 	ret = qmp_combo_com_init(qmp, false);
+ 	if (ret)
+ 		goto out_unlock;
+@@ -4382,6 +4397,13 @@ static int qmp_combo_usb_exit(struct phy *phy)
+ 	int ret;
+ 
+ 	mutex_lock(&qmp->phy_mutex);
++
++	/* init was skipped in DP_ONLY: usb_init_count was never incremented */
++	if (!qmp->usb_init_count) {
++		mutex_unlock(&qmp->phy_mutex);
++		return 0;
++	}
++
+ 	ret = qmp_combo_usb_power_off(phy);
+ 	if (ret)
+ 		goto out_unlock;

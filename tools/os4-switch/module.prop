@@ -1,0 +1,6 @@
+id=tb710fu_switch
+name=TB710FU 系统切换
+version=v1.0-local
+versionCode=1
+author=community
+description=在澎湃OS里一键重启进入 Arch Linux：把 boot_a 写成你构建的 Arch 默认镜像，写入前备份、写入后回读 sha256，失败自动回滚。镜像与配对哈希由 /data/adb/tbboot/pair.env 提供，不随仓库分发。

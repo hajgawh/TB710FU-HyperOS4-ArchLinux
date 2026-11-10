@@ -1,0 +1,115 @@
+#!/bin/sh
+# TB710FU: toggle the X4 (prime) hardware boost OPP.
+#
+# The EPSS hardware LUT has two ceilings:
+#   3052800 kHz - normal maximum, in scaling_available_frequencies
+#   3302400 kHz - boost entry, in scaling_boost_frequencies / OPP debugfs
+#                available=Y, selected only while the cpufreq boost flag is 1.
+#
+# The global /sys/devices/system/cpu/cpufreq/boost is preferred because it
+# covers every policy and does not depend on the policy number.  Policy
+# numbering changes when the 6-core DT is used (policy0/1/3/5, not
+# policy0/3/5/7), so never hard-code policy7 here.
+set -eu
+
+CONF=/etc/tb710fu/cpu-boost.conf
+GLOBAL=/sys/devices/system/cpu/cpufreq/boost
+
+wait_for_boost() {
+	i=0
+	while [ "$i" -lt 30 ]; do
+		[ -e "$GLOBAL" ] && return 0
+		for p in /sys/devices/system/cpu/cpufreq/policy*; do
+			[ -s "$p/scaling_boost_frequencies" ] && return 0
+		done
+		sleep 1
+		i=$((i + 1))
+	done
+	return 1
+}
+
+find_boost_policies() {
+	for p in /sys/devices/system/cpu/cpufreq/policy*; do
+		[ -s "$p/scaling_boost_frequencies" ] && printf '%s\n' "$p"
+	done
+}
+
+normal_max() {
+	# scaling_available_frequencies excludes the boost entry; the last value
+	# is the normal hardware ceiling (3052800 on this board).
+	awk '{print $NF}' "$1/scaling_available_frequencies" 2>/dev/null | tr -d ' '
+}
+
+boost_max() {
+	awk '{print $NF}' "$1/scaling_boost_frequencies" 2>/dev/null | tr -d ' '
+}
+
+boost_on() {
+	if [ -e "$GLOBAL" ]; then
+		echo 1 > "$GLOBAL"
+	else
+		found=0
+		for p in $(find_boost_policies); do
+			echo 1 > "$p/boost" || return 1
+			found=1
+		done
+		[ "$found" = 1 ] || return 1
+	fi
+	# Enabling boost raises cpuinfo.max_freq, but the user max_freq QoS is
+	# still the old normal ceiling.  Raise it explicitly so the governor can
+	# actually select the boost OPP.
+	for p in $(find_boost_policies); do
+		m=$(boost_max "$p")
+		[ -n "$m" ] && echo "$m" > "$p/scaling_max_freq" 2>/dev/null || true
+	done
+	return 0
+}
+
+boost_off() {
+	if [ -e "$GLOBAL" ]; then
+		echo 0 > "$GLOBAL"
+	fi
+	# cpuinfo.max_freq does not shrink when boost is disabled in the current
+	# cpufreq core, so derive the normal ceiling from the non-boost table.
+	# Only touch policies that actually expose a boost entry; leave a user's
+	# custom cap on the other clusters alone.
+	for p in $(find_boost_policies); do
+		m=$(normal_max "$p")
+		[ -n "$m" ] && echo "$m" > "$p/scaling_max_freq" 2>/dev/null || true
+	done
+	return 0
+}
+
+status() {
+	if [ -e "$GLOBAL" ]; then
+		printf 'global boost: %s\n' "$(cat "$GLOBAL")"
+	else
+		printf 'global boost: absent\n'
+	fi
+	for p in $(find_boost_policies); do
+		printf '%s: boost=%s max=%s cur=%s boost_freqs=%s\n' \
+			"${p##*/}" "$(cat "$p/boost" 2>/dev/null || echo '?')" \
+			"$(cat "$p/scaling_max_freq" 2>/dev/null || echo '?')" \
+			"$(cat "$p/scaling_cur_freq" 2>/dev/null || echo '?')" \
+			"$(cat "$p/scaling_boost_frequencies" 2>/dev/null | tr -s ' ' ' ')"
+	done
+}
+
+apply_conf() {
+	[ -r "$CONF" ] || return 0
+	# shellcheck disable=SC1090
+	. "$CONF"
+	case "${ENABLE:-0}" in
+		1|yes|true|on)  boost_on ;;
+		0|no|false|off) boost_off ;;
+		*) echo "invalid ENABLE in $CONF: ${ENABLE:-}" >&2; return 2 ;;
+	esac
+}
+
+case "${1:-status}" in
+	on|enable)  wait_for_boost || { echo "no cpufreq boost interface yet" >&2; exit 1; }; boost_on ;;
+	off|disable) wait_for_boost || exit 0; boost_off ;;
+	apply)      wait_for_boost || { echo "no cpufreq boost interface yet" >&2; exit 1; }; apply_conf ;;
+	status)     status ;;
+	*) echo "usage: $0 {on|off|apply|status}" >&2; exit 2 ;;
+esac

@@ -1,0 +1,49 @@
+#!/bin/sh
+# Start the patched krfb in the active Plasma session, on demand.
+set -eu
+
+if pgrep -x krfb >/dev/null 2>&1; then
+	echo "krfb already running (port 5900)"
+	exit 0
+fi
+
+SESSION_PID=$(pgrep -x plasmashell | head -1 || pgrep -x kwin_wayland | head -1 || true)
+if [ -z "$SESSION_PID" ]; then
+	echo "no Plasma session (plasmashell/kwin_wayland not running)" >&2
+	exit 1
+fi
+
+eval "$(tr '\0' '\n' < "/proc/$SESSION_PID/environ" |
+	grep -E '^(WAYLAND_DISPLAY|DISPLAY|DBUS_SESSION_BUS_ADDRESS|XDG_RUNTIME_DIR)=' |
+	sed 's/^/export /')" || true
+
+: "${WAYLAND_DISPLAY:=wayland-1}"
+: "${DISPLAY:=:1}"
+: "${XDG_RUNTIME_DIR:=/run/user/1001}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=/run/user/1001/bus}"
+export WAYLAND_DISPLAY DISPLAY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+if [ "$(id -u)" -eq 0 ]; then
+	SETUID="runuser -u archlinux --"
+else
+	SETUID=""
+fi
+
+# Keep the log in the session's runtime dir, one per invoking uid: root and the
+# desktop user can then start krfb independently without fighting over the file.
+LOG="$XDG_RUNTIME_DIR/krfb-$(id -u).log"
+
+$SETUID env HOME=/home/archlinux \
+	WAYLAND_DISPLAY="$WAYLAND_DISPLAY" DISPLAY="$DISPLAY" \
+	DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+	XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+	XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland \
+	setsid /usr/local/bin/krfb --nodialog </dev/null >>"$LOG" 2>&1 &
+
+sleep 3
+if ss -ltn | grep -q ':5900 '; then
+	echo "krfb listening on 5900 — set your own password in the KDE sharing dialog first"
+else
+	echo "krfb failed to listen, see $LOG" >&2
+	exit 1
+fi

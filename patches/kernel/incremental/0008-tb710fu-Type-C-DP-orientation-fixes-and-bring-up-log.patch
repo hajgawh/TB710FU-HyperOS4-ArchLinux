@@ -1,0 +1,739 @@
+From f42ba8a84b815d636667af6df733b97fd2664250 Mon Sep 17 00:00:00 2001
+From: tb <tb@local>
+Date: Mon, 9 Nov 2026 14:59:06 +0000
+Subject: [PATCH 8/8] tb710fu: Type-C DP orientation fixes and bring-up log
+ diet
+
+qmp-combo:
+- Never rebuild the COM block on an orientation change.  Record the new
+  orientation and let the next com_init() (0->1 refcount) program
+  TYPEC_CTRL/PHY_MODE_CTRL from it.  Rebuilding underneath a live DP link
+  left the DP PHY held in reset because qmpphy_mode was USB3_ONLY.
+- Split the mode/orientation programming out of com_init() into
+  qmp_combo_com_set_mode() so the "keep COM for USB3" fast path can rewrite
+  the mode bits without a full com_exit/com_init.
+- In that fast path stop the USB3 PCS before rewriting TYPEC_CTRL; writing
+  it while the SuperSpeed port is polling hangs the bus.
+- Guard dp_exit() against a negative init_count on an unbalanced
+  phy_exit() (otherwise the next com_init() silently skips programming).
+
+pmic_glink_altmode:
+- Acknowledge notifications for ports that have no connector node; a left
+  unacknowledged notification stops the firmware from reporting further
+  connections (UCSI port latch).
+- Delay only the DP connect HPD report by tb_hpd_delay_ms (default 1000,
+  0 = off).  The connector used to be reported connected while the dock's
+  SuperSpeed/USB2 hubs were still enumerating; KWin then enabled the output
+  in that window and a DPU register write on the settling PHY reset the SoC.
+  Unplug, the ACK and the mux switch all stay immediate; the delayed work
+  re-checks hpd_state/svid/mux_ctrl before reporting.
+
+Log diet (these investigations are closed):
+- ucsi_glink, wcd939x-usbss: dev_info/pr_info -> dev_dbg/pr_debug.
+- qmp-combo: keep-COM and USB3-init-wait messages -> debug.
+- altmode: per-notification port dump -> dev_dbg (keep the one-line
+  "deferred DP connect report").
+- nt36xxx: 11-line point-data checksum hex dump -> pr_debug (the one-line
+  "checksum not match" stays); missing "usb" power supply -> debug.
+- dsi_host: DSI underflow register dump and status line -> debug.
+- aw882xx: DEBUG stays on so aw_dev_err() remains pr_err(); aw_dev_info()
+  is compiled out unless TB710FU_AW_VERBOSE is set.
+
+Verified on the TB710FU: 8 plug/flip cycles with DP streaming, no reset and
+exactly one connector probe per plug; idle kernel log growth is 0 lines/min.
+---
+ drivers/gpu/drm/msm/dsi/dsi_host.c            |   4 +-
+ .../input/touchscreen/NT36XXX_SPI/nt36xxx.c   |   6 +-
+ drivers/phy/qualcomm/phy-qcom-qmp-combo.c     | 200 +++++++++++++-----
+ drivers/soc/qcom/pmic_glink_altmode.c         | 145 ++++++++++++-
+ drivers/usb/typec/mux/wcd939x-usbss.c         |  10 +-
+ drivers/usb/typec/ucsi/ucsi_glink.c           |  10 +-
+ sound/soc/codecs/aw882xx/aw882xx_log.h        |  20 +-
+ 7 files changed, 316 insertions(+), 79 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/dsi/dsi_host.c b/drivers/gpu/drm/msm/dsi/dsi_host.c
+index 441d500a1..bb2bf33e6 100644
+--- a/drivers/gpu/drm/msm/dsi/dsi_host.c
++++ b/drivers/gpu/drm/msm/dsi/dsi_host.c
+@@ -1703,7 +1703,7 @@ static void dsi_err_worker(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	pr_err_ratelimited("%s: status=%x\n", __func__, status);
++	pr_debug_ratelimited("%s: status=%x\n", __func__, status);
+ 	/* TB710FU: the MDP FIFO underflow here is a transient boot-window
+ 	 * event (~15-31 s after handover, while the desktop spins up).  The
+ 	 * sw_reset visibly blinks the panel AND hard-kills the NT36532 touch
+@@ -1812,7 +1812,7 @@ static void dsi_error(struct msm_dsi_host *msm_host)
+ 	/* TB710FU bring-up: print the raw registers before the handlers below
+ 	 * clear them - err_work_state only says "a FIFO error and a timeout",
+ 	 * the register contents say which FIFO bit and which timeout. */
+-	pr_err_ratelimited("TBDSI %s fifo=%#x timeout=%#x ack=%#x clk=%#x st0=%#x dln0=%#x lane=%#x vid=%#x acth=%#x tot=%#x\n",
++	pr_debug_ratelimited("TBDSI %s fifo=%#x timeout=%#x ack=%#x clk=%#x st0=%#x dln0=%#x lane=%#x vid=%#x acth=%#x tot=%#x\n",
+ 			   dev_name(&msm_host->pdev->dev),
+ 			   dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+ 			   dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS),
+diff --git a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+index 4ba1c1ecc..4bde50f13 100644
+--- a/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
++++ b/drivers/input/touchscreen/NT36XXX_SPI/nt36xxx.c
+@@ -1875,12 +1875,12 @@ static int32_t nvt_ts_point_data_checksum(uint8_t *buf, uint8_t length)
+ 			length, buf[length], checksum);
+ 
+ 		for (i = 0; i < 10; i++) {
+-			NVT_LOG("%02X %02X %02X %02X %02X %02X\n",
++			pr_debug("%02X %02X %02X %02X %02X %02X\n",
+ 				buf[1 + i * 6], buf[2 + i * 6], buf[3 + i * 6],
+ 				buf[4 + i * 6], buf[5 + i * 6], buf[6 + i * 6]);
+ 		}
+ 
+-		NVT_LOG("%02X %02X %02X %02X %02X\n", buf[61], buf[62], buf[63],
++		pr_debug("%02X %02X %02X %02X %02X\n", buf[61], buf[62], buf[63],
+ 			buf[64], buf[65]);
+ 
+ 		return -1;
+@@ -2731,7 +2731,7 @@ static void nvt_charger_notify_work(struct work_struct *work)
+ 
+ 	psy = power_supply_get_by_name("usb");
+ 	if (!psy) {
+-		NVT_ERR("Couldn't get usbpsy\n");
++		pr_debug_ratelimited("nvt: no usb power supply\n");
+ 		return ;
+ 	}
+ 
+diff --git a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+index c4df58a46..2fe497b4f 100644
+--- a/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
++++ b/drivers/phy/qualcomm/phy-qcom-qmp-combo.c
+@@ -2588,6 +2588,11 @@ struct qmp_combo {
+ 	int init_count;
+ 	enum qmpphy_mode qmpphy_mode;
+ 
++	/* TB710FU: mode last programmed into QPHY_V3_DP_COM_PHY_MODE_CTRL */
++	enum qmpphy_mode com_hw_mode;
++	/* TB710FU: orientation last programmed into QPHY_V3_DP_COM_TYPEC_CTRL */
++	enum typec_orientation com_hw_orientation;
++
+ 	/* TB710FU: USB3 init waits until the mux routes the combo to USB3 */
+ 	wait_queue_head_t tb_mode_wq;
+ 
+@@ -4011,13 +4016,67 @@ static int qmp_combo_dp_calibrate(struct phy *phy)
+ 	return ret;
+ }
+ 
++/*
++ * TB710FU: program the COM block for the current orientation/mode.
++ *
++ * Split out of qmp_combo_com_init() so the "keep COM" fast path in
++ * qmp_combo_apply_mode() can reprogram the mode bits without power-cycling
++ * the whole block.  The caller must ensure the block is powered
++ * (init_count > 0).
++ */
++static void qmp_combo_com_set_mode(struct qmp_combo *qmp)
++{
++	const struct qmp_phy_cfg *cfg = qmp->cfg;
++	void __iomem *com = qmp->com;
++	u32 val;
++
++	/* Use software based port select and switch on typec orientation */
++	val = SW_PORTSELECT_MUX;
++	if (qmp->orientation == TYPEC_ORIENTATION_REVERSE)
++		val |= SW_PORTSELECT_VAL;
++
++	if (cfg->invert_cc_polarity)
++		val |= INVERT_CC_POLARITY;
++
++	writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
++
++	switch (qmp->qmpphy_mode) {
++	case QMPPHY_MODE_USB3DP:
++		writel(USB3_MODE | DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
++
++		/* bring both QMP USB and QMP DP PHYs PCS block out of reset */
++		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
++				SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
++				SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
++		break;
++
++	case QMPPHY_MODE_DP_ONLY:
++		writel(DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
++
++		/* bring QMP DP PHY PCS block out of reset */
++		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
++				SW_DPPHY_RESET_MUX | SW_DPPHY_RESET);
++		break;
++
++	case QMPPHY_MODE_USB3_ONLY:
++		writel(USB3_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
++
++		/* bring QMP USB PHY PCS block out of reset */
++		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
++				SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
++		break;
++	}
++
++	qmp->com_hw_mode = qmp->qmpphy_mode;
++	qmp->com_hw_orientation = qmp->orientation;
++}
++
+ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ {
+ 	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 	void __iomem *com = qmp->com;
+ 	void __iomem *aon_toggle;
+ 	int ret;
+-	u32 val;
+ 
+ 	if (!force && qmp->init_count++)
+ 		return 0;
+@@ -4069,42 +4128,7 @@ static int qmp_combo_com_init(struct qmp_combo *qmp, bool force)
+ 		qphy_clrbits(aon_toggle, cfg->regs[QPHY_DP_AON_TOGGLE_ENABLE], 0x1);
+ 	}
+ 
+-	/* Use software based port select and switch on typec orientation */
+-	val = SW_PORTSELECT_MUX;
+-	if (qmp->orientation == TYPEC_ORIENTATION_REVERSE)
+-		val |= SW_PORTSELECT_VAL;
+-
+-	if (cfg->invert_cc_polarity)
+-		val |= INVERT_CC_POLARITY;
+-
+-	writel(val, com + QPHY_V3_DP_COM_TYPEC_CTRL);
+-
+-	switch (qmp->qmpphy_mode) {
+-	case QMPPHY_MODE_USB3DP:
+-		writel(USB3_MODE | DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+-
+-		/* bring both QMP USB and QMP DP PHYs PCS block out of reset */
+-		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+-				SW_DPPHY_RESET_MUX | SW_DPPHY_RESET |
+-				SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+-		break;
+-
+-	case QMPPHY_MODE_DP_ONLY:
+-		writel(DP_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+-
+-		/* bring QMP DP PHY PCS block out of reset */
+-		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+-				SW_DPPHY_RESET_MUX | SW_DPPHY_RESET);
+-		break;
+-
+-	case QMPPHY_MODE_USB3_ONLY:
+-		writel(USB3_MODE, com + QPHY_V3_DP_COM_PHY_MODE_CTRL);
+-
+-		/* bring QMP USB PHY PCS block out of reset */
+-		qphy_clrbits(com, QPHY_V3_DP_COM_RESET_OVRD_CTRL,
+-				SW_USB3PHY_RESET_MUX | SW_USB3PHY_RESET);
+-		break;
+-	}
++	qmp_combo_com_set_mode(qmp);
+ 
+ 	qphy_clrbits(com, QPHY_V3_DP_COM_SWI_CTRL, 0x03);
+ 	qphy_clrbits(com, QPHY_V3_DP_COM_SW_RESET, SW_RESET);
+@@ -4170,10 +4194,15 @@ static int qmp_combo_dp_exit(struct phy *phy)
+ 
+ 	mutex_lock(&qmp->phy_mutex);
+ 
++	/* TB710FU: never let init_count go negative on an unbalanced exit */
++	if (!qmp->dp_init_count) {
++		mutex_unlock(&qmp->phy_mutex);
++		return 0;
++	}
++
+ 	qmp_combo_com_exit(qmp, false);
+ 
+-	if (qmp->dp_init_count)
+-		qmp->dp_init_count--;
++	qmp->dp_init_count--;
+ 
+ 	/* Replay a mux switch that was deferred while DP owned the PHY.
+ 	 * The work runs outside phy_mutex (we hold it here) and re-takes it. */
+@@ -4342,12 +4371,12 @@ static void qmp_combo_tb_wait_usb3(struct qmp_combo *qmp)
+ 	if (READ_ONCE(qmp->qmpphy_mode) != QMPPHY_MODE_DP_ONLY)
+ 		return;
+ 
+-	pr_info("TB710FU qmp: USB3 init waiting for mux (mode=%d)\n",
++	pr_debug("TB710FU qmp: USB3 init waiting for mux (mode=%d)\n",
+ 		qmp->qmpphy_mode);
+ 	wait_event_timeout(qmp->tb_mode_wq,
+ 		READ_ONCE(qmp->qmpphy_mode) != QMPPHY_MODE_DP_ONLY,
+ 		msecs_to_jiffies(1000));
+-	pr_info("TB710FU qmp: USB3 init proceeding (mode=%d)\n",
++	pr_debug("TB710FU qmp: USB3 init proceeding (mode=%d)\n",
+ 		qmp->qmpphy_mode);
+ }
+ 
+@@ -4369,7 +4398,7 @@ static int qmp_combo_usb_init(struct phy *phy)
+ 	 * USB3 PHY up through qmp_combo_apply_mode().
+ 	 */
+ 	if (READ_ONCE(qmp->qmpphy_mode) == QMPPHY_MODE_DP_ONLY) {
+-		dev_info(qmp->dev, "TB710FU qmp: USB3 init skipped (DP_ONLY)\n");
++		dev_dbg(qmp->dev, "TB710FU qmp: USB3 init skipped (DP_ONLY)\n");
+ 		mutex_unlock(&qmp->phy_mutex);
+ 		return 0;
+ 	}
+@@ -4862,25 +4891,36 @@ static int qmp_combo_typec_switch_set(struct typec_switch_dev *sw,
+ 				      enum typec_orientation orientation)
+ {
+ 	struct qmp_combo *qmp = typec_switch_get_drvdata(sw);
+-	const struct qmp_phy_cfg *cfg = qmp->cfg;
+ 
+ 	if (orientation == qmp->orientation || orientation == TYPEC_ORIENTATION_NONE)
+ 		return 0;
+ 
+ 	mutex_lock(&qmp->phy_mutex);
+-	qmp->orientation = orientation;
+ 
+-	if (qmp->init_count) {
+-		if (qmp->usb_init_count)
+-			qmp_combo_usb_power_off(qmp->usb_phy);
+-		qmp_combo_com_exit(qmp, true);
++	/*
++	 * TB710FU: record the new orientation, never rebuild the COM block
++	 * here.
++	 *
++	 * pmic_glink_altmode calls typec_switch_set() before typec_mux_set()
++	 * and before the HPD notification, so a fast re-plug (or a connector
++	 * flip) arrives while the previous DP session may still hold the PHY.
++	 * The old code ran
++	 *     usb_power_off -> com_exit(force) -> com_init(force) -> usb_power_on
++	 * underneath a live DP link: msm_dp keeps power_on/phy_initialized
++	 * set, never runs phy_init() again and therefore never retrains, and
++	 * com_init() programs the block from qmp->qmpphy_mode, which is
++	 * USB3_ONLY right after a detach - the DP PHY is then left held in
++	 * reset and the next register access (teardown or the next plug's
++	 * AUX/training) hangs the bus and resets the SoC.
++	 *
++	 * com_init() programs QPHY_V3_DP_COM_TYPEC_CTRL from qmp->orientation
++	 * and QPHY_V3_DP_COM_PHY_MODE_CTRL from qmp->qmpphy_mode, and it
++	 * always runs on the 0 -> 1 reference transition, i.e. on the first
++	 * phy_init() of the next cable session.  Recording the orientation is
++	 * enough; the hardware follows on the next init.
++	 */
++	qmp->orientation = orientation;
+ 
+-		qmp_combo_com_init(qmp, true);
+-		if (qmp->usb_init_count)
+-			qmp_combo_usb_power_on(qmp->usb_phy);
+-		if (qmp->dp_init_count)
+-			cfg->dp_aux_init(qmp);
+-	}
+ 	mutex_unlock(&qmp->phy_mutex);
+ 
+ 	return 0;
+@@ -4893,6 +4933,58 @@ static void qmp_combo_apply_mode(struct qmp_combo *qmp, enum qmpphy_mode new_mod
+ 	dev_dbg(qmp->dev, "typec_mux_set: switching from qmpphy mode %d to %d\n",
+ 		qmp->qmpphy_mode, new_mode);
+ 
++	/*
++	 * TB710FU: USB3DP and USB3_ONLY both route USB3.  A full COM rebuild
++	 * power-cycles the USB3 PCS; if that lands while the SS hub is
++	 * enumerating, the link dies and the dock's DP output resets too.
++	 * Keep the COM/USB3 state intact for USB3-to-USB3 changes; the DP
++	 * side is configured by its own phy_ops.
++	 */
++	if (qmp->usb_init_count &&
++	    (qmp->qmpphy_mode == QMPPHY_MODE_USB3DP ||
++	     qmp->qmpphy_mode == QMPPHY_MODE_USB3_ONLY) &&
++	    (new_mode == QMPPHY_MODE_USB3DP ||
++	     new_mode == QMPPHY_MODE_USB3_ONLY)) {
++		dev_dbg(qmp->dev,
++			 "TB710FU qmp: keep COM for USB3, mode %d -> %d\n",
++			 qmp->qmpphy_mode, new_mode);
++		qmp->tb_mux_pending = false;
++		qmp->qmpphy_mode = new_mode;
++		/*
++		 * TB710FU: program the COM when entering a DP-capable mode so
++		 * the DP PHY is not left held in reset when com_init() ran
++		 * with USB3_ONLY (USB3 init can precede the mux switch).
++		 *
++		 * Never program the USB3-only direction: clearing DP_MODE
++		 * while the SuperSpeed link is enumerating makes xhci fail
++		 * with "Cannot enable" and latches the dock's SS hub.
++		 */
++		if (new_mode != QMPPHY_MODE_USB3_ONLY &&
++		    qmp->init_count &&
++		    (qmp->com_hw_mode != new_mode ||
++		     qmp->com_hw_orientation != qmp->orientation)) {
++			/*
++			 * Stop the USB3 PCS before re-routing TYPEC_CTRL:
++			 * writing it while the SuperSpeed port is polling
++			 * hangs the bus (flip-while-streaming reset).
++			 */
++			if (qmp->usb_init_count)
++				qmp_combo_usb_power_off(qmp->usb_phy);
++			qmp_combo_com_set_mode(qmp);
++			if (qmp->usb_init_count) {
++				int tb_ret = qmp_combo_usb_power_on(qmp->usb_phy);
++				if (tb_ret)
++					dev_err(qmp->dev,
++						"TB710FU qmp: USB3 restart failed %d\n",
++						tb_ret);
++			}
++		}
++		if (new_mode == QMPPHY_MODE_USB3DP && qmp->dp_init_count)
++			cfg->dp_aux_init(qmp);
++		wake_up_all(&qmp->tb_mode_wq);
++		return;
++	}
++
+ 	qmp->tb_mux_pending = false;
+ 	qmp->qmpphy_mode = new_mode;
+ 
+diff --git a/drivers/soc/qcom/pmic_glink_altmode.c b/drivers/soc/qcom/pmic_glink_altmode.c
+index 6f092c1c4..6901884d9 100644
+--- a/drivers/soc/qcom/pmic_glink_altmode.c
++++ b/drivers/soc/qcom/pmic_glink_altmode.c
+@@ -6,6 +6,8 @@
+ #include <linux/auxiliary_bus.h>
+ #include <linux/bitfield.h>
+ #include <linux/cleanup.h>
++#include <linux/devm-helpers.h>
++#include <linux/jiffies.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_device.h>
+@@ -20,9 +22,21 @@
+ #include <linux/usb/typec_mux.h>
+ #include <linux/usb/typec_retimer.h>
+ #include <linux/usb/typec_tbt.h>
++#include <linux/workqueue.h>
+ 
+ #include <linux/soc/qcom/pmic_glink.h>
+ 
++/*
++ * TB710FU: the ADSP reports DP HPD high a few hundred milliseconds after
++ * the Type-C mux was re-routed, while the SuperSpeed/USB2 hub tree is
++ * still enumerating.  Bringing DP up in that window has hard-reset this
++ * platform; delaying only the connect report keeps the two apart.
++ * 0 disables the delay (A/B testing).
++ */
++static unsigned int tb_hpd_delay_ms = 1000;
++module_param(tb_hpd_delay_ms, uint, 0644);
++MODULE_PARM_DESC(tb_hpd_delay_ms, "TB710FU: delay DP connect HPD report (ms, 0=off)");
++
+ #define PMIC_GLINK_MAX_PORTS	3
+ 
+ #define USBC_SC8180X_NOTIFY_IND	0x13
+@@ -113,6 +127,10 @@ struct pmic_glink_altmode_port {
+ 
+ 	struct auxiliary_device *bridge;
+ 
++	/* TB710FU: deferred DP connect report, see tb_hpd_delay_ms */
++	struct delayed_work hpd_work;
++	bool hpd_notified;
++
+ 	enum typec_orientation orientation;
+ 	u16 svid;
+ 	struct usbc_sc8280x_tbt_data tbt_data;
+@@ -138,6 +156,10 @@ struct pmic_glink_altmode {
+ 
+ 	struct work_struct enable_work;
+ 
++	/* Ports without a connector node with a notification to acknowledge */
++	struct work_struct ack_work;
++	unsigned long ack_pending;
++
+ 	struct pmic_glink_altmode_port ports[PMIC_GLINK_MAX_PORTS];
+ };
+ 
+@@ -346,11 +368,87 @@ static void pmic_glink_altmode_safe(struct pmic_glink_altmode *altmode,
+ 		dev_err(altmode->dev, "failed to setup retimer to USB: %d\n", ret);
+ }
+ 
++/*
++ * The firmware expects every port notification to be acknowledged, also for
++ * ports that have no connector node and are otherwise ignored here; one left
++ * unacknowledged can keep it from reporting further connections. Acknowledge
++ * those from process context, as pmic_glink_altmode_request() sleeps.
++ */
++static void pmic_glink_altmode_ack_worker(struct work_struct *work)
++{
++	struct pmic_glink_altmode *altmode = container_of(work, struct pmic_glink_altmode,
++							  ack_work);
++	unsigned int port;
++
++	for (port = 0; port < BITS_PER_LONG; port++) {
++		if (test_and_clear_bit(port, &altmode->ack_pending))
++			pmic_glink_altmode_request(altmode, ALTMODE_PAN_ACK, port);
++	}
++}
++
++static void pmic_glink_altmode_ack_undefined(struct pmic_glink_altmode *altmode, u8 port)
++{
++	dev_dbg(altmode->dev, "notification on undefined port %d\n", port);
++
++	if (port >= BITS_PER_LONG)
++		return;
++
++	set_bit(port, &altmode->ack_pending);
++	schedule_work(&altmode->ack_work);
++}
++
++static void pmic_glink_altmode_hpd_worker(struct work_struct *work)
++{
++	struct pmic_glink_altmode_port *alt_port =
++		container_of(to_delayed_work(work),
++			     struct pmic_glink_altmode_port, hpd_work);
++
++	/*
++	 * TB710FU: re-check what the firmware reported when the delay was
++	 * armed.  A pseudo detach (USB3DP -> USB3_ONLY) or a real unplug in
++	 * the meantime must not become a connect report: the mux is then
++	 * routed away from DP and msm_dp would program the combo PHY for
++	 * USB3 only.
++	 */
++	if (!READ_ONCE(alt_port->hpd_state) ||
++	    alt_port->svid != USB_TYPEC_DP_SID ||
++	    alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
++		dev_dbg(alt_port->altmode->dev,
++			"TB710FU altmode: dropped deferred DP connect\n");
++		return;
++	}
++
++	WRITE_ONCE(alt_port->hpd_notified, true);
++	dev_info(alt_port->altmode->dev,
++		 "TB710FU altmode: deferred DP connect report (%u ms)\n",
++		 tb_hpd_delay_ms);
++	drm_aux_hpd_bridge_notify(&alt_port->bridge->dev,
++				  connector_status_connected);
++}
++
++static void pmic_glink_altmode_hpd_cancel(void *data)
++{
++	struct pmic_glink_altmode_port *alt_port = data;
++
++	cancel_delayed_work_sync(&alt_port->hpd_work);
++}
++
+ static void pmic_glink_altmode_worker(struct work_struct *work)
+ {
+ 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
+ 	struct pmic_glink_altmode *altmode = alt_port->altmode;
+-	enum drm_connector_status conn_status;
++
++	/*
++	 * TB710FU debug: the firmware re-announces the alt-mode state on
++	 * every CC event, including the pseudo detach (USB3DP -> USB3_ONLY)
++	 * that precedes the real DP entry.  Print what it actually sent so
++	 * the detach path (svid/mux_ctrl/hpd) can be told apart in the log.
++	 */
++	dev_dbg(altmode->dev,
++		 "TB710FU altmode: port=%u orientation=%u svid=0x%04x mux_ctrl=%u mode=%u hpd=%u irq=%u\n",
++		 alt_port->index, alt_port->orientation, alt_port->svid,
++		 alt_port->mux_ctrl, alt_port->mode, alt_port->hpd_state,
++		 alt_port->hpd_irq);
+ 
+ 	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+ 
+@@ -369,12 +467,28 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
+ 						     alt_port->hpd_irq);
+ 		}
+ 
+-		if (alt_port->hpd_state)
+-			conn_status = connector_status_connected;
+-		else
+-			conn_status = connector_status_disconnected;
+-
+-		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
++		/*
++		 * TB710FU: hold the connect edge back until the dock's
++		 * SuperSpeed/USB2 hubs are done enumerating.  Replays after
++		 * the first report are forwarded as before; msm_dp dedupes
++		 * them itself.  Unplug is never delayed.
++		 */
++		if (alt_port->hpd_state) {
++			if (tb_hpd_delay_ms &&
++			    !READ_ONCE(alt_port->hpd_notified)) {
++				schedule_delayed_work(&alt_port->hpd_work,
++						      msecs_to_jiffies(tb_hpd_delay_ms));
++			} else {
++				WRITE_ONCE(alt_port->hpd_notified, true);
++				drm_aux_hpd_bridge_notify(&alt_port->bridge->dev,
++							  connector_status_connected);
++			}
++		} else {
++			cancel_delayed_work_sync(&alt_port->hpd_work);
++			WRITE_ONCE(alt_port->hpd_notified, false);
++			drm_aux_hpd_bridge_notify(&alt_port->bridge->dev,
++						  connector_status_disconnected);
++		}
+ 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
+ 		if (alt_port->svid == USB_TYPEC_TBT_SID)
+ 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
+@@ -441,7 +555,7 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
+ 	svid = mux == 2 ? USB_TYPEC_DP_SID : 0;
+ 
+ 	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode) {
+-		dev_dbg(altmode->dev, "notification on undefined port %d\n", port);
++		pmic_glink_altmode_ack_undefined(altmode, port);
+ 		return;
+ 	}
+ 
+@@ -483,7 +597,7 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
+ 	orientation = notify->orientation;
+ 
+ 	if (port >= ARRAY_SIZE(altmode->ports) || !altmode->ports[port].altmode) {
+-		dev_dbg(altmode->dev, "notification on undefined port %d\n", port);
++		pmic_glink_altmode_ack_undefined(altmode, port);
+ 		return;
+ 	}
+ 
+@@ -599,6 +713,11 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 	init_completion(&altmode->pan_ack);
+ 	mutex_init(&altmode->lock);
+ 
++	ret = devm_work_autocancel(dev, &altmode->ack_work,
++				   pmic_glink_altmode_ack_worker);
++	if (ret)
++		return ret;
++
+ 	device_for_each_child_node(dev, fwnode) {
+ 		ret = fwnode_property_read_u32(fwnode, "reg", &port);
+ 		if (ret < 0) {
+@@ -622,6 +741,14 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
+ 		alt_port->altmode = altmode;
+ 		alt_port->index = port;
+ 		INIT_WORK(&alt_port->work, pmic_glink_altmode_worker);
++		INIT_DELAYED_WORK(&alt_port->hpd_work,
++				  pmic_glink_altmode_hpd_worker);
++
++		ret = devm_add_action_or_reset(dev,
++					       pmic_glink_altmode_hpd_cancel,
++					       alt_port);
++		if (ret)
++			return ret;
+ 
+ 		alt_port->bridge = devm_drm_dp_hpd_bridge_alloc(dev, to_of_node(fwnode));
+ 		if (IS_ERR(alt_port->bridge)) {
+diff --git a/drivers/usb/typec/mux/wcd939x-usbss.c b/drivers/usb/typec/mux/wcd939x-usbss.c
+index f49471eb3..6abbfdd4e 100644
+--- a/drivers/usb/typec/mux/wcd939x-usbss.c
++++ b/drivers/usb/typec/mux/wcd939x-usbss.c
+@@ -511,7 +511,7 @@ static int wcd939x_usbss_set(struct wcd939x_usbss *usbss)
+ 	    sel0 == usbss->tb_select0 && eq == usbss->tb_eq)
+ 		return 0;
+ 
+-	pr_info("TB710FU usbss: program usb=%d dp=%d rev=%d en=0x%02x sel0=0x%02x eq=%d\n",
++	pr_debug("TB710FU usbss: program usb=%d dp=%d rev=%d en=0x%02x sel0=0x%02x eq=%d\n",
+ 		enable_usb, enable_dp, usbss->tb_reverse, en, sel0, !!eq);
+ 
+ 	if (!usbss->tb_valid) {
+@@ -615,7 +615,7 @@ static void tb_apply_work(struct work_struct *work)
+ 	 * the cable is really gone.
+ 	 */
+ 	if (usbss->orientation != TYPEC_ORIENTATION_NONE) {
+-		pr_info("TB710FU usbss: skip deferred switch write, cable attached (orientation=%d mode=0x%lx)\n",
++		pr_debug("TB710FU usbss: skip deferred switch write, cable attached (orientation=%d mode=0x%lx)\n",
+ 			usbss->orientation, usbss->mode);
+ 		mutex_unlock(&usbss->lock);
+ 		return;
+@@ -624,7 +624,7 @@ static void tb_apply_work(struct work_struct *work)
+ 	ret = wcd939x_usbss_set(usbss);
+ 	mutex_unlock(&usbss->lock);
+ 
+-	pr_info("TB710FU usbss: deferred disconnect apply ret=%d mode=0x%lx\n",
++	pr_debug("TB710FU usbss: deferred disconnect apply ret=%d mode=0x%lx\n",
+ 		ret, usbss->mode);
+ }
+ 
+@@ -641,7 +641,7 @@ static void tb_defer_disconnect(struct wcd939x_usbss *usbss)
+ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
+ 				    enum typec_orientation orientation)
+ {
+-	pr_info("TB710FU usbss: switch_set orientation=%d\n", orientation);
++	pr_debug("TB710FU usbss: switch_set orientation=%d\n", orientation);
+ 	struct wcd939x_usbss *usbss = typec_switch_get_drvdata(sw);
+ 	int ret = 0;
+ 
+@@ -672,7 +672,7 @@ static int wcd939x_usbss_switch_set(struct typec_switch_dev *sw,
+ static int wcd939x_usbss_mux_set(struct typec_mux_dev *mux,
+ 				 struct typec_mux_state *state)
+ {
+-	pr_info("TB710FU usbss: mux_set mode=0x%lx svid=0x%04x\n",
++	pr_debug("TB710FU usbss: mux_set mode=0x%lx svid=0x%04x\n",
+ 		state->mode, state->alt ? state->alt->svid : 0);
+ 	struct wcd939x_usbss *usbss = typec_mux_get_drvdata(mux);
+ 	int ret = 0;
+diff --git a/drivers/usb/typec/ucsi/ucsi_glink.c b/drivers/usb/typec/ucsi/ucsi_glink.c
+index 9ba438284..80646f94c 100644
+--- a/drivers/usb/typec/ucsi/ucsi_glink.c
++++ b/drivers/usb/typec/ucsi/ucsi_glink.c
+@@ -307,7 +307,7 @@ static void pmic_glink_ucsi_notify(struct work_struct *work)
+ 		return;
+ 	}
+ 
+-	dev_info(ucsi->dev, "TB710FU ucsi: notify cci=0x%08x\n", cci);
++	dev_dbg(ucsi->dev, "TB710FU ucsi: notify cci=0x%08x\n", cci);
+ 
+ 	ucsi_notify_common(ucsi->ucsi, cci);
+ }
+@@ -338,19 +338,19 @@ static void pmic_glink_ucsi_callback(const void *data, size_t len, void *priv)
+ 
+ 	switch (le32_to_cpu(hdr->opcode)) {
+ 	case UC_UCSI_READ_BUF_REQ:
+-		dev_info(ucsi->dev, "TB710FU ucsi: read_buf_req len=%zu\n", len);
++		dev_dbg(ucsi->dev, "TB710FU ucsi: read_buf_req len=%zu\n", len);
+ 		pmic_glink_ucsi_read_ack(ucsi, data, len);
+ 		break;
+ 	case UC_UCSI_WRITE_BUF_REQ:
+-		dev_info(ucsi->dev, "TB710FU ucsi: write_buf_req len=%zu\n", len);
++		dev_dbg(ucsi->dev, "TB710FU ucsi: write_buf_req len=%zu\n", len);
+ 		pmic_glink_ucsi_write_ack(ucsi, data, len);
+ 		break;
+ 	case UC_UCSI_USBC_NOTIFY_IND:
+-		dev_info(ucsi->dev, "TB710FU ucsi: usbc_notify_ind\n");
++		dev_dbg(ucsi->dev, "TB710FU ucsi: usbc_notify_ind\n");
+ 		schedule_work(&ucsi->notify_work);
+ 		break;
+ 	default:
+-		dev_info(ucsi->dev, "TB710FU ucsi: opcode=0x%x len=%zu\n",
++		dev_dbg(ucsi->dev, "TB710FU ucsi: opcode=0x%x len=%zu\n",
+ 			 le32_to_cpu(hdr->opcode), len);
+ 		break;
+ 	}
+diff --git a/sound/soc/codecs/aw882xx/aw882xx_log.h b/sound/soc/codecs/aw882xx/aw882xx_log.h
+index c49089319..1ec8b1483 100644
+--- a/sound/soc/codecs/aw882xx/aw882xx_log.h
++++ b/sound/soc/codecs/aw882xx/aw882xx_log.h
+@@ -17,21 +17,39 @@
+ /********************************************
+  * print information control
+  *******************************************/
+-/* TB710FU: force-enable the drivers logging (temporary debug build) */
++/*
++ * TB710FU: DEBUG stays on so that aw_dev_err() remains pr_err().  The info
++ * chatter (aw_dev_info -> pr_info, ~40 lines per playback session) was enabled
++ * for the speaker-crackle investigation, which is on hold; it is compiled out
++ * unless TB710FU_AW_VERBOSE is set.  Keep aw_dev_err(): "start failed" and the
++ * other error paths are the useful signal.
++ */
+ #define DEBUG 1
+ 
++#ifndef TB710FU_AW_VERBOSE
++#define TB710FU_AW_VERBOSE 0
++#endif
++
+ #ifdef DEBUG
+ #define aw_dev_err(dev, format, ...) \
+ 		pr_err("[Awinic][%s]%s: " format "\n", dev_name(dev), __func__, ##__VA_ARGS__)
++#if TB710FU_AW_VERBOSE
+ #define aw_dev_info(dev, format, ...) \
+ 		pr_info("[Awinic][%s]%s: " format "\n", dev_name(dev), __func__, ##__VA_ARGS__)
++#else
++#define aw_dev_info(dev, format, ...) no_printk(format, ##__VA_ARGS__, dev)
++#endif
+ #define aw_dev_dbg(dev, format, ...) \
+ 		pr_debug("[Awinic][%s]%s: " format "\n", dev_name(dev), __func__, ##__VA_ARGS__)
+ 
+ #define aw_pr_err(format, ...) \
+ 		pr_err("[Awinic]%s: " format "\n", __func__, ##__VA_ARGS__)
++#if TB710FU_AW_VERBOSE
+ #define aw_pr_info(format, ...) \
+ 		pr_info("[Awinic]%s: " format "\n", __func__, ##__VA_ARGS__)
++#else
++#define aw_pr_info(format, ...) no_printk(format, ##__VA_ARGS__)
++#endif
+ #define aw_pr_dbg(format, ...) \
+ 		pr_debug("[Awinic]%s: " format "\n", __func__, ##__VA_ARGS__)
+ #else

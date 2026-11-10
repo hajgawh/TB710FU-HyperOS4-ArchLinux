@@ -1,0 +1,70 @@
+#!/bin/sh
+# TB710FU: KWin launches the virtual keyboard too early at login, and the
+# first plasma-keyboard instance can come up wedged: tapping a text field
+# shows nothing, and "disable / re-enable + Apply" in the KCM fixes it because
+# that restarts the IM process.  Toggling the InputMethod key does the same.
+#
+# v3 (2026-11-09): keep only the early +6s toggle.  The former +30s/+75s
+# re-toggles were removed because the +75s one could block KWin's main thread
+# for ~10s on this device, and a single toggle is enough to revive the usual
+# wedged instance; if it is still wedged, run this script (or toggle the KCM)
+# manually.
+set -u
+
+KEY=InputMethod
+DEFAULT=/usr/share/applications/org.kde.plasma.keyboard.desktop
+USER_DIR=/run/user/1001
+USER_BUS=unix:path=$USER_DIR/bus
+
+# Never touch root's (nonexistent) session; hand off to the desktop user with
+# an EXPLICIT session environment: runuser preserves the caller's env, and a
+# root ssh can carry DBUS_SESSION_BUS_ADDRESS=/run/user/0/bus, which sends the
+# KConfig notify to the wrong bus where KWin cannot hear it (all toggles then
+# silently do nothing).
+if [ "$(id -u)" = 0 ] && [ -d "$USER_DIR" ]; then
+	exec runuser -u archlinux -- env HOME=/home/archlinux \
+		XDG_RUNTIME_DIR="$USER_DIR" DBUS_SESSION_BUS_ADDRESS="$USER_BUS" "$0" "$@"
+fi
+
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && [ -S "$USER_DIR/bus" ]; then
+	export XDG_RUNTIME_DIR="$USER_DIR"
+	export DBUS_SESSION_BUS_ADDRESS="$USER_BUS"
+fi
+
+log() { logger -t tb-vk-restart "$*"; }
+
+kb_pids() { pgrep -x plasma-keyboard | tr "\n" "," ; }
+
+visible() {
+	busctl --user get-property org.kde.KWin /VirtualKeyboard \
+		org.kde.kwin.VirtualKeyboard visible 2>/dev/null | grep -q true
+}
+
+attempt() { # $1 = label, $2 = skip-if-visible (yes/no)
+	if [ "$2" = yes ] && visible; then
+		log "$1 skipped: keyboard currently visible (working)"
+		return
+	fi
+	log "$1: re-toggling InputMethod (plasma-keyboard pid: $(kb_pids))"
+	kwriteconfig6 --file kwinrc --group Wayland --key "$KEY" "" --notify
+	sleep 2
+	kwriteconfig6 --file kwinrc --group Wayland --key "$KEY" "$cur" --notify
+	sleep 4
+	log "$1: done, plasma-keyboard pid now: $(kb_pids)"
+}
+
+# Wait for the Plasma session and the portal to settle before the toggle.
+sleep 6
+
+cur=$(kreadconfig6 --file kwinrc --group Wayland --key "$KEY" 2>/dev/null)
+[ -n "$cur" ] || cur=$DEFAULT
+
+attempt "boot+6s" no
+
+# Restarting the IM drops the user fcitx5 instance; it is only used for
+# hardware-keyboard input now (the virtual keyboard uses Plasma Keyboard).
+if ! pgrep -x fcitx5 >/dev/null 2>&1; then
+	setsid fcitx5 -d >/dev/null 2>&1 || true
+	log "revived fcitx5"
+fi
+log "finished; final plasma-keyboard pid: $(kb_pids)"

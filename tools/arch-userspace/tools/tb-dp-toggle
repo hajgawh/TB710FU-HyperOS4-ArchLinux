@@ -1,0 +1,12 @@
+#!/bin/bash
+# TB710FU: toggle the external DP output.
+# Bind this to a key: run it before unplugging the Type-C cable, and after
+# plugging it back in.  Unplugging while DP is streaming hard-resets the
+# board (ADSP/PHY level, not fixable in the DP driver).
+set -eu
+
+if [ "$(cat /sys/class/drm/card1-DP-1/enabled 2>/dev/null)" = "enabled" ]; then
+	exec /usr/local/bin/tb-dp-off
+else
+	exec /usr/local/bin/tb-dp-on
+fi

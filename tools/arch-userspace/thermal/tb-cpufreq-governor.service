@@ -1,0 +1,12 @@
+[Unit]
+Description=TB710FU: apply the configured cpufreq governor
+After=multi-user.target
+ConditionPathExists=/sys/devices/system/cpu/cpufreq
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tb-cpufreq-governor
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

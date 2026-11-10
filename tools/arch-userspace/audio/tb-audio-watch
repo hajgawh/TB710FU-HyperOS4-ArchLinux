@@ -1,0 +1,30 @@
+#!/bin/bash
+# TB710FU audio event watcher: timestamped dmesg + ALSA PCM state changes.
+# Used to correlate "the speaker crackled at 04:31" with kernel events.
+LOG=/var/log/tb-audio/watch.log
+mkdir -p /var/log/tb-audio
+if [ -f "$LOG" ] && [ "$(stat -c%s "$LOG")" -gt 2000000 ]; then
+    mv -f "$LOG" "$LOG.1"
+fi
+exec >>"$LOG" 2>&1
+echo "=== watch start $(date -Is) ==="
+
+# Kernel side: every amp/TDM/DSP/LPASS message, with kernel timestamps.
+dmesg -W --time-format iso -l emerg,alert,crit,err,warn,notice,info 2>/dev/null \
+  | grep --line-buffered -iE "aw882xx|awinic|TDM ep|TBPROBE|q6apm|lpass|audioreach|pll|bop|ocp|xrun|pcmC0D|TBDBG" &
+
+# ALSA side: log every PCM state transition, including XRUN, with the
+# ring-buffer position at that moment.
+last=""
+while :; do
+    st=$(sed -n "s/^state: //p" /proc/asound/card0/pcm0p/sub0/status 2>/dev/null)
+    if [ "$st" != "$last" ]; then
+        echo "$(date -Is) pcm0p state=${st:-closed}"
+        if [ -n "$st" ]; then
+            sed -n "s/^\(delay\|avail\|hw_ptr\|appl_ptr\|trigger_time\)/    \1/p" \
+                /proc/asound/card0/pcm0p/sub0/status
+        fi
+        last="$st"
+    fi
+    sleep 0.1
+done

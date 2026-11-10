@@ -1,0 +1,52 @@
+# ksystemstats 6.8.2 + ksystemstats MR !149 (Qualcomm MSM platform GPU sensors)
+# 本地验证构建版：pkgrel 1.1，官方后续任何 6.8.2-2 / 6.9.x 都会自动覆盖升级
+pkgname=ksystemstats
+pkgver=6.8.2
+_dirver=$(echo $pkgver | cut -d. -f1-3)
+pkgrel=1.1
+pkgdesc='A plugin based system monitoring daemon'
+arch=(aarch64)
+url='https://kde.org/plasma-desktop/'
+license=(LGPL-2.0-or-later)
+depends=(glibc
+         kcoreaddons
+         kcrash
+         ki18n
+         kio
+         libksysguard
+         libstdc++
+         lm_sensors
+         qt6-base
+         solid)
+makedepends=(extra-cmake-modules
+             libnl
+             networkmanager-qt)
+optdepends=('libnl: network usage monitor'
+            'networkmanager-qt: network usage monitor'
+            'systemd-libs: GPU monitor')
+groups=(plasma)
+source=(https://download.kde.org/stable/plasma/$_dirver/$pkgname-$pkgver.tar.xz
+        mr149.patch
+        local-fallback.patch)
+sha256sums=('2a71fa12b3dd8ad4a6c31feae253b1d1ed7fb0ddd44c8d27a32b63583f8b4889'
+            'SKIP'
+            '1e0f91afb28e551056f74f45b3beae2932b2f6444eac8b6c2d157cb6092df7d8')
+
+prepare() {
+  cd $pkgname-$pkgver
+  patch -Np1 --forward -i ../mr149.patch
+  patch -Np1 --forward -i ../local-fallback.patch
+}
+
+build() {
+  cmake -B build -S $pkgname-$pkgver \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DKDE_INSTALL_LIBDIR=lib \
+    -DBUILD_TESTING=OFF \
+    -DKDE_INSTALL_LIBEXECDIR=lib
+  cmake --build build
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install build
+}

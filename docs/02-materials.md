@@ -48,7 +48,7 @@ M7–M15 是 Arch/桌面可选，M6 是 root 可选；**M13 相机 APK 对 411d 
 | M4 | firehose programmer | `prog_firehose_ddr-TB710FU.melf` | Qualcomm DDR/UFS programmer，9008 读写用 | OS3 移植包 `bin/9008/`；或 ZUI 救援包 | `file`、`sha256sum`、`edl --loader=... --memory=ufs printgpt`（只读） | 否（Qualcomm/联想） |
 | M5 | 你自己的 boot 链备份 | `boot_a`、`init_boot_a`、`dtbo_a`、`vendor_boot_a`、`vbmeta_a`；另加 GPT 与唯一分区 | 你设备的 GKI 6.1.128、ramdisk、DTBO、AVB 元数据 | 你自己的设备：EDL `r` 或已 root 的 `dd` | `shasum -a 256`、`avbtool info_image`、大小对比 `sgdisk --info` | 否（含设备唯一数据） |
 | M6 | KernelSU-Next | `v3.4.2` LKM，KMI `android14-6.1`，包名 `com.rifsxd.ksunext` | APK + 与 GKI 6.1.128 匹配的 LKM | GitHub Releases：<https://github.com/KernelSU-Next/KernelSU-Next/releases> | `apksigner verify --print-certs`、`aapt2 dump badging`、`sha256sum`；刷后 `su -c id` | 是（GPL-3.0；建议链接官方 release） |
-| M7 | ArchLinuxARM aarch64 rootfs | `ArchLinuxARM-aarch64-latest.tar.gz`（以页面当日为准） | aarch64 rootfs、pacman、systemd、基础工具 | <https://archlinuxarm.org/> / <https://os.archlinuxarm.org/os/>（含 `.md5`、`.sig`） | `md5sum -c`、`gpg --verify`、`tar -tzf`、`uname -m` | 是（按 ALARM 许可证；用官方 tarball） |
+| M7 | ArchLinuxARM aarch64 rootfs | `ArchLinuxARM-aarch64-latest.tar.gz`（以页面当日为准） | aarch64 rootfs、pacman、systemd、基础工具 | <https://archlinuxarm.org/> / <http://os.archlinuxarm.org/os/>（**http**；含 `.md5`、`.sig`） | `md5sum -c`、`gpg --verify`、`tar -tzf`、`uname -m` | 是（按 ALARM 许可证；用官方 tarball） |
 | M8 | Linux 7.3 源码 | `linux-7.3.tar.xz`（vanilla，`v7.x`） | 内核源码 | <https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.3.tar.xz> | `sha256sum` / `gpg --verify` | 是（GPL-2.0） |
 | M9 | kShimC 源码/产物 | 上游 `sunflower2333/kShimC`；产物 `kShimC.bin` 约 4 MiB | 开机菜单、按键、屏幕、内核交接 | <https://github.com/sunflower2333/kShimC>；构建组合见上游 `tb710fu-hyperos-steamos/docs/dualboot-kshim.md` | `sha256sum`、`file`、`ls -l`（4,194,304 B 量级） | 见上游许可证 |
 | M10 | DualBootKernelPatcher | `Project-Aloha/DualBootKernelPatcher`，上游记录 commit `2276163` | `MultiBootKernelPatcher`，把 GKI + Linux + DTB 打进一个 boot | <https://github.com/Project-Aloha/DualBootKernelPatcher> | `git rev-parse`、`file`、`--help`；`kshim_pack_boot.py` 能找到它 | 见上游许可证 |
@@ -183,6 +183,9 @@ tools/venv/bin/pip install --upgrade pip edl protobuf
 ```text
 https://android.googlesource.com/platform/external/avb     # 整树，分支 main / android-<版本>
 ```
+
+> 这个域名在部分网络（含作者本机，2026-11-10 实测）会**直接超时**（`curl` 报
+> `Connection timed out`）。遇到这种情况别怀疑文件，换下面的 GitHub 镜像。
 
 **GitHub 镜像（2026-11-10 实测可访问）：**
 
@@ -762,7 +765,9 @@ ArchLinuxARM-aarch64-latest.tar.gz
 来源：
 
 - <https://archlinuxarm.org/> → 下载页；
-- 或直接 <https://os.archlinuxarm.org/os/>（同目录有 `.md5`、`.sig`）。
+- 或直接 <http://os.archlinuxarm.org/os/>（**必须用 http**：该主机名的 https 证书不匹配
+  主机名，`curl https://...` 会报 `no alternative certificate subject name`；同目录有
+  `.md5`、`.sig`，下载后照上面对 `gpg --verify`）。
 
 校验：
 
